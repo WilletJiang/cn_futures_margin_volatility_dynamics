@@ -23,19 +23,9 @@
 
 ### Python环境配置
 
-本项目使用Python 3.9版本，选择该版本是因为其稳定性和与关键包的良好兼容性。我们已经创建并配置了一个名为`futures_analysis`的conda环境，其中包含了所有必要的依赖包。
+本项目使用Python 3.9版本，并推荐使用Conda处理依赖。
 
-#### 方法1：使用已创建的Conda环境（推荐）
-
-```bash
-# 激活已创建的环境
-conda activate futures_analysis
-
-# 验证环境
-python -c "import numpy as np; import pandas as pd; import matplotlib.pyplot as plt; import scipy as sp; import statsmodels.api as sm; import linearmodels as lm; import arch; print('环境设置成功！')"
-```
-
-#### 方法2：在新机器上重新创建环境
+#### 方法1：Conda 创建环境
 
 ```bash
 # 使用environment.yml创建新环境
@@ -43,7 +33,7 @@ conda env create -f environment.yml
 conda activate futures_analysis
 ```
 
-#### 方法3：使用pip安装依赖（不推荐）
+#### 方法2：使用pip安装依赖（不推荐）
 
 ```bash
 # 创建虚拟环境
@@ -57,7 +47,7 @@ pip install -r requirements.txt
 
 ### R环境配置
 
-本项目的某些分析也可以使用R完成，特别是对于面板数据差分法分析和局部投影方法。
+本项目的某些分析需要使用使用R完成，特别是对于面板数据差分法分析和局部投影方法。
 
 ```bash
 # 安装R包
@@ -66,7 +56,7 @@ Rscript R_requirements.R
 
 ### 已安装的核心依赖包
 
-我们的`futures_analysis`环境包含以下主要组件，所有版本均经过精心选择以确保兼容性和稳定性：
+我们的`futures_analysis`环境包含以下主要组件：
 
 - **Python版本**: 3.9.18
 - **数据处理**: 
@@ -105,8 +95,7 @@ Rscript R_requirements.R
 
 ### 数据准备
 
-1. 将原始期货数据文件放入 `data/raw/` 目录
-2. 将节假日和保证金调整公告日期数据放入 `data/raw/` 目录
+将期货数据文件放入 `data/raw/` 目录
 
 ### 运行分析
 
@@ -207,4 +196,4 @@ conda activate futures_analysis
    - 编写报告
 
 ## 贡献者
-[您的姓名]
+[姜高]
