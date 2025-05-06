@@ -133,7 +133,9 @@ def run_did_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
     if 'contract_id' not in df.columns:
          logging.error("数据中缺少 'contract_id' 列。")
          return False
-    cols_to_r = ['contract_id', 'time_period', 'first_treat_period', outcome_var] + control_vars
+    # 新增数值型ID列，供 R did 包使用
+    df['numeric_id'] = pd.factorize(df['contract_id'])[0] + 1
+    cols_to_r = ['numeric_id', 'time_period', 'first_treat_period', outcome_var] + control_vars
     
     # 检查所有需要的列是否存在
     missing_cols_final = [c for c in cols_to_r if c not in df.columns]
@@ -143,7 +145,8 @@ def run_did_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
         
     df_r = df[cols_to_r].copy()
     rows_before = df_r.shape[0]
-    df_r.dropna(inplace=True)
+    # 仅删除关键列缺失的行，避免删除所有观测
+    df_r.dropna(subset=['numeric_id', 'time_period', 'first_treat_period', outcome_var], inplace=True)
     logging.info(f"因缺失值删除 {rows_before - df_r.shape[0]} 行，剩余 {df_r.shape[0]} 行。")
 
     if df_r.empty:
@@ -166,7 +169,7 @@ def run_did_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
     try:
         yname = outcome_var
         tname = "time_period"
-        idname = "contract_id"
+        idname = "numeric_id"
         gname = "first_treat_period"
         data_r = r_df
         control_group_r = ro.StrVector([control_group_type])
@@ -187,9 +190,11 @@ def run_did_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
              att_gt_results = did.att_gt(
                  yname=yname, tname=tname, idname=idname, gname=gname,
                  data=data_r, xformla=xformla_r, control_group=control_group_r,
-                 est_method=est_method_r, panel=panel_r,
+                 est_method=est_method, panel=panel_r,
                  allow_unbalanced_panel=allow_unbalanced_r,
-                 bstrap=True, cband=True
+                 weightsname=ro.NULL,
+                 bstrap=True, cband=True,
+                 na_rm=True
              )
         logging.info("did::att_gt 函数执行成功。")
 

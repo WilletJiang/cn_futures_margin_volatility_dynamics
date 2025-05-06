@@ -145,7 +145,7 @@ def build_features():
         'trading_volume': 'volume',
         'open_interest': 'open_interest',
         'margin_rate': config.MARGIN_RATE_COLUMN, # 使用 config 中定义的保证金列名
-        'announcement_date': 'announcement_date', # 保留公告日期
+        'announce_date': 'announcement_date', # 保留公告日期
         # 保留其他可能需要的原始列
         'variety': 'variety',
         'exchange': 'exchange',
@@ -229,6 +229,10 @@ def build_features():
     # 3.1 波动率
     df['gk_vol_sq'] = calculate_gk_volatility(df['high'], df['low'], df['close'], df['open'])
     df['log_gk_volatility'] = np.log(np.sqrt(df['gk_vol_sq']))
+
+    # 添加日志量变量计算 (volume和open_interest)
+    df['log_volume'] = np.log(df['volume'].replace(0, 1e-10))  # 避免log(0)
+    df['log_open_interest'] = np.log(df['open_interest'].replace(0, 1e-10))  # 避免log(0)
 
     # 替代波动率 (用于稳健性)
     df['parkinson_vol_sq'] = calculate_parkinson_volatility(df['high'], df['low'])
@@ -408,11 +412,15 @@ def build_features():
     # 删除每个组开头不满足最小观测期的行
     df_final = df_final.groupby('contract_id').filter(lambda x: len(x) >= min_obs_required)
     # 或者，更精确地删除开头因计算产生的 NaN 行
-    df_final.dropna(subset=config.CONTROL_VARIABLES + \
-                           [col for col in df.columns if col.startswith('market_regime_')] + \
-                           [col for col in df.columns if col.startswith('volatility_regime_')] + \
-                           [config.LIQUIDITY_PROXY_VAR, config.ALT_VOLATILITY_VAR], # 检查所有滞后和滚动计算的变量
-                    inplace=True)
+    
+    # 准备实际存在的控制变量列表
+    existing_control_vars = [var for var in config.CONTROL_VARIABLES if var in df_final.columns]
+    existing_regime_vars = [col for col in df_final.columns if col.startswith('market_regime_') or col.startswith('volatility_regime_')]
+    existing_extra_vars = [var for var in [config.LIQUIDITY_PROXY_VAR, config.ALT_VOLATILITY_VAR] if var in df_final.columns]
+
+    # 使用实际存在的变量进行dropna
+    if existing_control_vars or existing_regime_vars or existing_extra_vars:
+        df_final.dropna(subset=existing_control_vars + existing_regime_vars + existing_extra_vars, inplace=True)
 
 
     logging.info(f"最终面板数据形状: {df_final.shape}")

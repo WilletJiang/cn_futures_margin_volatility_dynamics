@@ -132,7 +132,6 @@ CONTROL_VARIABLES = [
     "log_volume_lag1",
     "log_open_interest_lag1",
     "return_lag1",
-    "limit_hit_dummy_lag1" # 涨跌停指示变量 (需要创建)
 ]
 
 # --- 7.1 流动性代理变量 (用于 3.4 节分析) ---

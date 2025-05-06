@@ -10,6 +10,12 @@ import numpy as np
 import os
 import logging
 import argparse # 用于命令行参数
+import sys
+
+# 确保能够找到项目根目录
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))  # 上两级目录
+sys.path.insert(0, PROJECT_ROOT)  # 将项目根目录添加到Python路径
 
 # --- 项目配置和分析脚本导入 ---
 try:
@@ -17,22 +23,12 @@ try:
     # 导入重构后的核心分析和绘图函数
     from src.analysis.did_cs_analysis import run_did_analysis_core
     from src.analysis.lp_irf_analysis import run_lp_analysis_core
-    from src.visualization.plot_did_results import plot_did_core as plot_did_results_core # 避免命名冲突
-    from src.visualization.plot_lp_irf_results import plot_lp_irf_core as plot_lp_irf_results_core # 避免命名冲突
+    from src.visualization.plot_did_results import plot_did_core as plot_did_results_core  # 避免命名冲突
+    from src.visualization.plot_lp_irf_results import plot_lp_irf_core as plot_lp_irf_results_core  # 避免命名冲突
 except ImportError as e:
-    import sys
     logging.error(f"导入模块时出错: {e}")
-    PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    sys.path.insert(0, PACKAGE_DIR)
-    try:
-        from src import config
-        from src.analysis.did_cs_analysis import run_did_analysis_core
-        from src.analysis.lp_irf_analysis import run_lp_analysis_core
-        from src.visualization.plot_did_results import plot_did_core as plot_did_results_core
-        from src.visualization.plot_lp_irf_results import plot_lp_irf_core as plot_lp_irf_results_core
-    except ImportError as e_inner:
-         logging.error(f"尝试从 sys.path 添加后再次导入失败: {e_inner}")
-         exit()
+    logging.error(f"当前Python路径: {sys.path}")
+    sys.exit(1)
 
 
 # --- 日志配置 ---
