@@ -116,10 +116,139 @@ def run_alt_model_specs(base_data):
     4.2 运行替代模型设定检验
     """
     logging.info("--- 开始稳健性检验: 替代模型设定 ---")
-    # TODO: 实现 LP 不同滞后阶数、LP-DID 等
-    # 例如: 修改 LP_CONTROL_LAGS 或实现 LP-DID 逻辑
-    logging.warning("替代模型设定检验尚未完全实现。")
-    # ... 实现逻辑 ...
+    main_outcome_var = config.OUTCOME_VAR.replace('_lag1', '') # 假设主结果变量也需要移除_lag1
+
+    # 定义不同的模型设定
+    specs_to_run = []
+
+    # --- DID 的替代设定 ---
+    # 设定 1: DID 无控制变量
+    specs_to_run.append({
+        "name": "did_no_controls",
+        "type": "did",
+        "params": {"control_vars": []},
+        "output_suffix": "_did_no_ctrl"
+    })
+    # 设定 2: DID 使用 IPW 估计方法 (如果 DR 是默认)
+    if "dr" == config.DID_EST_METHOD: # 假设 config 中有 DID_EST_METHOD
+        specs_to_run.append({
+            "name": "did_ipw_method",
+            "type": "did",
+            "params": {"est_method": "ipw"},
+            "output_suffix": "_did_ipw"
+        })
+    # 设定 3: DID 使用 never treated 控制组 (如果 notyettreated 是默认)
+    # 需要确认数据中是否有真正的 never treated 组，并且 config.DID_CONTROL_GROUP_TYPE 存在
+    if hasattr(config, 'DID_CONTROL_GROUP_TYPE') and config.DID_CONTROL_GROUP_TYPE == "notyettreated":
+         specs_to_run.append({
+             "name": "did_nevertreated_group",
+             "type": "did",
+             "params": {"control_group_type": "nevertreated"},
+             "output_suffix": "_did_never_treated"
+         })
+
+
+    # --- LP-IRF 的替代设定 ---
+    # 设定 4: LP-IRF 使用较短的 horizon
+    short_horizon = max(1, config.LP_HORIZON // 2) # 例如，主 horizon 的一半，至少为1
+    if short_horizon < config.LP_HORIZON:
+        specs_to_run.append({
+            "name": f"lp_short_horizon_{short_horizon}",
+            "type": "lp",
+            "params": {"lp_horizon": short_horizon},
+            "output_suffix": f"_lp_short_h{short_horizon}"
+        })
+    # 设定 5: LP-IRF 使用较长的 horizon
+    long_horizon = config.LP_HORIZON + 5 # 例如，主 horizon + 5
+    specs_to_run.append({
+        "name": f"lp_long_horizon_{long_horizon}",
+        "type": "lp",
+        "params": {"lp_horizon": long_horizon},
+        "output_suffix": f"_lp_long_h{long_horizon}"
+    })
+    # 设定 6: LP-IRF 无控制变量
+    specs_to_run.append({
+        "name": "lp_no_controls",
+        "type": "lp",
+        "params": {"controls": []},
+        "output_suffix": "_lp_no_ctrl"
+    })
+
+    if not specs_to_run:
+        logging.warning("没有定义可运行的替代模型设定。")
+        logging.info("--- 完成稳健性检验: 替代模型设定 (无操作) ---")
+        return
+
+    logging.info(f"将运行以下替代模型设定: {[s['name'] for s in specs_to_run]}")
+
+    for spec in specs_to_run:
+        logging.info(f"--- 开始运行替代设定: {spec['name']} ---")
+        spec_data = base_data.copy() # 每个设定使用独立的数据副本
+        spec_table_dir = os.path.join(ROBUSTNESS_TABLE_DIR, f"alt_spec_{spec['name']}")
+        spec_figure_dir = os.path.join(ROBUSTNESS_FIGURE_DIR, f"alt_spec_{spec['name']}")
+        os.makedirs(spec_table_dir, exist_ok=True)
+        os.makedirs(spec_figure_dir, exist_ok=True)
+
+        output_suffix = spec['output_suffix']
+
+        try:
+            if spec['type'] == 'did':
+                logging.info(f"运行 DID 分析 (设定: {spec['name']}, 结果变量: {main_outcome_var})...")
+                # 获取当前 spec 的参数，如果参数未在 spec 中定义，则使用 None (让 core 函数使用其默认值或 config 值)
+                did_params = {
+                    "outcome_var": main_outcome_var,
+                    "output_table_dir": spec_table_dir,
+                    "output_suffix": output_suffix,
+                    "control_vars": spec['params'].get('control_vars'), # None if not set
+                    "control_group_type": spec['params'].get('control_group_type'), # None if not set
+                    "est_method": spec['params'].get('est_method') # None if not set
+                }
+                # 移除值为 None 的参数，以便 core 函数使用其内部默认值
+                did_params_cleaned = {k: v for k, v in did_params.items() if v is not None}
+
+                did_success = run_did_analysis_core(data=spec_data, **did_params_cleaned)
+
+                if did_success:
+                    logging.info(f"DID 分析 ({spec['name']}) 核心逻辑执行成功。")
+                    did_results_file = os.path.join(spec_table_dir, f"did_aggregate_results{output_suffix}.csv")
+                    did_plot_file = os.path.join(spec_figure_dir, f"did_event_study_plot{output_suffix}.png")
+                    if os.path.exists(did_results_file):
+                        plot_did_results_core(results_filepath=did_results_file,
+                                              output_filepath=did_plot_file,
+                                              title_suffix=f" ({spec['name']})")
+                    else:
+                        logging.warning(f"未找到 DID 结果文件 {did_results_file} ({spec['name']})，无法绘图。")
+                else:
+                    logging.error(f"DID 分析 ({spec['name']}) 核心逻辑执行失败。")
+
+            elif spec['type'] == 'lp':
+                logging.info(f"运行 LP-IRF 分析 (设定: {spec['name']}, 结果变量: {main_outcome_var})...")
+                # 获取当前 spec 的参数
+                lp_params = {
+                    "outcome_var": main_outcome_var,
+                    "output_table_dir": spec_table_dir,
+                    "output_suffix": output_suffix,
+                    "controls": spec['params'].get('controls'), # None if not set
+                    "lp_horizon": spec['params'].get('lp_horizon') # None if not set
+                }
+                # 移除值为 None 的参数
+                lp_params_cleaned = {k: v for k, v in lp_params.items() if v is not None}
+
+                lp_success = run_lp_analysis_core(data=spec_data, **lp_params_cleaned)
+
+                if lp_success:
+                    logging.info(f"LP-IRF 分析 ({spec['name']}) 核心逻辑执行成功。")
+                    plot_lp_irf_results_core(table_dir=spec_table_dir,
+                                             figure_dir=spec_figure_dir,
+                                             suffix=output_suffix)
+                else:
+                    logging.error(f"LP-IRF 分析 ({spec['name']}) 核心逻辑执行失败。")
+
+        except Exception as e:
+            logging.error(f"运行替代模型设定 {spec['name']} 时出错: {e}", exc_info=True)
+
+        logging.info(f"--- 完成运行替代设定: {spec['name']} ---")
+
     logging.info("--- 完成稳健性检验: 替代模型设定 ---")
 
 

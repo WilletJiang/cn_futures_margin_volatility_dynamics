@@ -28,7 +28,7 @@ echo "描述性统计表格生成完成。"
 # 步骤 3: 运行核心分析 (DID 和 LP-IRF)
 echo "\n[步骤 3/5] 运行核心分析..."
 echo "  - 运行 DID 分析 (did_cs_analysis.py)..."
-python src/analysis/did_cs_analysis.py
+python src/analysis/did_cs_analysis_multi_event.py
 if [ $? -ne 0 ]; then
     echo "错误：DID 分析失败，脚本终止。"
     exit 1

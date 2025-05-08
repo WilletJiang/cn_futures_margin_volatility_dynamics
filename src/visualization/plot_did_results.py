@@ -42,6 +42,9 @@ def plot_did_core(results_filepath, output_filepath, title_suffix=""):
     # --- 1. 加载结果数据 ---
     try:
         results_df = pd.read_csv(results_filepath)
+        if results_df.empty or results_df.columns.size == 0:
+            logging.warning(f"DID 结果文件 {results_filepath} 为空或无表头，跳过绘图。")
+            return True
         logging.info(f"已加载 DID 结果数据: {results_df.shape}")
         logging.info(f"结果文件列名: {results_df.columns.tolist()}")
     except FileNotFoundError:

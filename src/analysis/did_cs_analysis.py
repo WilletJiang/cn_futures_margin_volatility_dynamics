@@ -108,9 +108,10 @@ def run_did_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
         logging.error(f"结果变量 '{outcome_var}' 不在数据中。")
         return False
 
-    # 时间和分组变量
-    df['time_period'] = df['date'].dt.year
-    df['first_treat_period'] = df['treat_date_g'].dt.year
+    # 修改为更细粒度的时间标识（年月组合），避免所有观测在第一时期就被视为"已处理"
+    # 时间和分组变量 - 使用年月组合作为更细粒度的时间标识
+    df['time_period'] = df['date'].dt.year * 100 + df['date'].dt.month
+    df['first_treat_period'] = df['treat_date_g'].dt.year * 100 + df['treat_date_g'].dt.month
 
     # 处理从未处理的组
     if control_group_type == "nevertreated":
@@ -145,18 +146,29 @@ def run_did_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
         
     df_r = df[cols_to_r].copy()
     rows_before = df_r.shape[0]
+    # 诊断：打印各列缺失值数量
+    na_counts = df_r.isna().sum()
+    logging.info("DID 数据缺失统计:\n" + na_counts.to_string())
     # 仅删除关键列缺失的行，避免删除所有观测
     df_r.dropna(subset=['numeric_id', 'time_period', 'first_treat_period', outcome_var], inplace=True)
     logging.info(f"因缺失值删除 {rows_before - df_r.shape[0]} 行，剩余 {df_r.shape[0]} 行。")
-
+    # 删除控制变量的缺失观测，以免 att_gt 预处理阶段剔除全部数据
+    rows_before_ctrl = df_r.shape[0]
+    if control_vars:
+        df_r.dropna(subset=control_vars, inplace=True)
+        logging.info(f"因控制变量缺失删除 {rows_before_ctrl - df_r.shape[0]} 行，剩余 {df_r.shape[0]} 行。")
     if df_r.empty:
-        logging.error("数据准备后为空，无法进行 DID 分析。")
+        logging.error("去除控制变量缺失后数据为空，无法进行 DID 分析。")
         return False
 
     # --- 2. 转换为 R Data Frame ---
     logging.info("将数据转换为 R data.frame...")
     try:
         # 在函数内部使用 localconverter 确保转换作用域
+        # 将 first_treat_period 和 time_period 列转换为数值型
+        df_r['first_treat_period'] = pd.to_numeric(df_r['first_treat_period'], errors='coerce').astype(int)
+        df_r['time_period'] = pd.to_numeric(df_r['time_period'], errors='coerce').astype(int)
+        logging.info("已将 first_treat_period 和 time_period 转换为数值型。")
         with localconverter(ro.default_converter + pandas2ri.converter):
             r_df = ro.conversion.py2rpy(df_r)
     except Exception as e:
@@ -193,31 +205,49 @@ def run_did_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
                  est_method=est_method, panel=panel_r,
                  allow_unbalanced_panel=allow_unbalanced_r,
                  weightsname=ro.NULL,
-                 bstrap=True, cband=True,
-                 na_rm=True
+                 bstrap=True, cband=True
              )
         logging.info("did::att_gt 函数执行成功。")
 
     except RRuntimeError as e:
-        logging.error(f"执行 R did::att_gt 时出错: {e}")
-        return False
+        logging.warning(f"ATT(g,t) 分析失败: {e}，将保存空结果文件并继续。")
+        # 保存空的 ATT(g,t) 文件
+        save_results_df(pd.DataFrame(), f"did_att_gt_results{output_suffix}.csv", output_table_dir)
+        analysis_successful = False
+        att_gt_results = None
     except Exception as e:
-        logging.error(f"调用 did::att_gt 时发生未知错误: {e}")
-        return False
+        logging.warning(f"未知错误执行 ATT(g,t): {e}，保存空文件继续。")
+        save_results_df(pd.DataFrame(), f"did_att_gt_results{output_suffix}.csv", output_table_dir)
+        analysis_successful = False
+        att_gt_results = None
 
     # --- 4. 保存 att(g,t) 结果 ---
-    att_gt_summary_df = pd.DataFrame() # 初始化为空
-    try:
-        summary_att_gt = R.summary(att_gt_results)
-        with localconverter(ro.default_converter + pandas2ri.converter):
-            att_gt_summary_df = ro.conversion.rpy2py(summary_att_gt)
-        logging.info("ATT(g,t) 结果提取成功。")
-        save_results_df(att_gt_summary_df, f"did_att_gt_results{output_suffix}.csv", output_table_dir)
-    except Exception as e:
-        logging.error(f"提取或保存 ATT(g,t) 结果时出错: {e}")
-        # 不在此处返回 False，继续尝试 aggte
+    # 仅当 att_gt_results 非空时，执行 summary 提取
+    if att_gt_results is not None:
+        att_gt_summary_df = pd.DataFrame() # 初始化为空
+        try:
+            summary_att_gt = R.summary(att_gt_results)
+            with localconverter(ro.default_converter + pandas2ri.converter):
+                att_gt_summary_df = ro.conversion.rpy2py(summary_att_gt)
+            logging.info("ATT(g,t) 结果提取成功。")
+            save_results_df(att_gt_summary_df, f"did_att_gt_results{output_suffix}.csv", output_table_dir)
+        except Exception as e:
+            logging.error(f"提取或保存 ATT(g,t) 结果时出错: {e}")
+            # 不在此处返回 False，继续尝试 aggte
+    else:
+        # 已在异常捕获处保存空的 did_att_gt_results.csv，跳过摘要提取
+        pass
 
-    # --- 5. 执行 R did::aggte (计算聚合效应) ---
+    # 如果 att_gt_results 为空，直接保存空的聚合文件并跳过 aggte
+    if att_gt_results is None:
+        # 生成带有标准列的空聚合结果，供绘图脚本读取
+        empty_agg_df = pd.DataFrame(columns=['event_time', 'estimate', 'conf.low', 'conf.high'])
+        save_results_df(empty_agg_df, f"did_aggregate_results{output_suffix}.csv", output_table_dir)
+        logging.warning("跳过 AGGTE 分析，已生成带有表头的空 did_aggregate_results 文件。")
+        logging.info(f"--- 完成核心 DID 分析 (Outcome: {outcome_var}, Suffix: '{output_suffix}') ---")
+        return analysis_successful
+
+    # --- 5. 执行 R did::aggte
     logging.info("调用 R did::aggte 函数计算聚合效应...")
     agg_results_df = pd.DataFrame() # 初始化为空
     analysis_successful = True # 默认成功，除非后续步骤失败
@@ -235,7 +265,6 @@ def run_did_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
                 type = "dynamic",
                 min_e = min_e,
                 max_e = max_e,
-                na_rm = True # 移除无法计算的时期
             )
         logging.info("did::aggte 函数执行成功。")
 
