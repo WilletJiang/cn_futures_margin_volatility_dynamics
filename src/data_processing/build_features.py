@@ -324,6 +324,16 @@ def build_features():
     # 调整定义：在 holiday_window_label 非空的日期，发生了保证金变动 (dlog_margin_rate != 0)
     df['is_holiday_adjustment_day'] = (df['holiday_window_label'] != '') & (np.abs(df['dlog_margin_rate']) > 1e-8)
 
+    # --- 调试：检查哪些合约从未有过 is_holiday_adjustment_day --- 
+    contracts_with_any_holiday_adjustment = df[df['is_holiday_adjustment_day']]['contract_id'].unique()
+    all_contracts = df['contract_id'].unique()
+    contracts_never_holiday_adjusted = [c for c in all_contracts if c not in contracts_with_any_holiday_adjustment]
+    if contracts_never_holiday_adjusted:
+        logging.info(f"调试信息：以下合约从未有过 is_holiday_adjustment_day == True: {contracts_never_holiday_adjusted}")
+    else:
+        logging.info("调试信息：所有合约都至少有一次 is_holiday_adjustment_day == True。")
+    # --- 结束调试 ---
+
     # 5.3 确定每个合约首次被处理的组 (g) 和处理时间 (首次调整日)
     # g 定义为首次发生节假日调整的 holiday_window_label
     df['treat_date_g'] = df[df['is_holiday_adjustment_day']].groupby('contract_id')['date'].transform('min')
@@ -331,8 +341,44 @@ def build_features():
     df['treat_group_g_label'] = df.groupby('contract_id')['treat_group_g_label'].transform('first') # 广播到该合约所有日期
     df['treat_date_g'] = df.groupby('contract_id')['treat_date_g'].transform('first') # 广播
 
+    # --- 诊断：检查各合约的处理日期和处理前数据点 ---
+    if 'treat_date_g' in df.columns:
+        logging.info("--- 诊断：各合约处理日期及处理前数据点 (初步) ---")
+        df['date'] = pd.to_datetime(df['date'])
+        # 在赋值给 df['treat_date_g'] 之前，原始的 df[df['is_holiday_adjustment_day']].groupby('contract_id')['date'].transform('min') 
+        # 已经生成了 NaT (如果某些 contract_id 没有 is_holiday_adjustment_day)
+        # 所以这里直接转换类型即可
+        df['treat_date_g'] = pd.to_datetime(df['treat_date_g'], errors='coerce')
+
+        # 统计 NaT (潜在控制组)
+        nat_treat_date_contracts = df[df['treat_date_g'].isna()]['contract_id'].nunique()
+        logging.info(f"初步诊断：发现 {nat_treat_date_contracts} 个合约的 treat_date_g 为 NaT (潜在控制组)。")
+
+        # 对于有有效 treat_date_g 的合约进行诊断
+        # 注意：这里我们使用 df 的副本进行操作，避免影响原始的 df 列
+        diagnose_df = df.copy()
+        treated_contracts_info = diagnose_df.dropna(subset=['treat_date_g']).copy() 
+
+        if not treated_contracts_info.empty:
+            pre_treatment_counts = treated_contracts_info.groupby('contract_id').apply(
+                lambda grp: grp[grp['date'] < grp['treat_date_g'].iloc[0]].shape[0] if pd.notna(grp['treat_date_g'].iloc[0]) else 0
+            )
+            pre_treatment_counts.name = 'pre_treatment_points'
+            
+            summary_df = treated_contracts_info[['contract_id', 'treat_date_g']].drop_duplicates(subset=['contract_id']).set_index('contract_id')
+            summary_df = summary_df.join(pre_treatment_counts)
+            
+            logging.info("初步诊断：有实际处理日期的合约详情：")
+            for contract_id_val, row in summary_df.iterrows():
+                logging.info(f"  合约 {contract_id_val}: "
+                             f"首次处理日期 treat_date_g = {row['treat_date_g'].strftime('%Y-%m-%d') if pd.notna(row['treat_date_g']) else 'N/A'}, "
+                             f"在该日期前的数据点数 (初步) = {row['pre_treatment_points']}")
+        else:
+            logging.info("初步诊断：没有找到具有有效 treat_date_g 的合约进行详细处理前数据点统计。")
+        logging.info("--- 完成初步诊断 ---")
+
     # 创建 C&S DID 需要的变量:
-    # - first_treatment_period: 合约首次接受处理的“时期”（这里用 treat_date_g）
+    # - first_treatment_period: 合约首次接受处理的"时期"（这里用 treat_date_g）
     # - time_period: 当前观测的时期（这里用 date）
     # - outcome: 结果变量 (log_gk_volatility)
     # - group: 分组变量 (treat_group_g_label) - C&S 的 att_gt 会自动处理
@@ -399,31 +445,80 @@ def build_features():
 
     # 去重并保留存在的列
     final_columns = sorted(list(set(col for col in final_columns if col in df.columns)))
-
-
     df_final = df[final_columns].copy()
 
-    # 处理计算滞后项和滚动窗口导致的初始 NaN
-    # 计算每个合约需要多少非缺失观测才能进行所有计算
-    # 例如，最长的回看期 + 滞后期
-    max_lookback = max(config.MARKET_REGIME_LOOKBACK, config.VOLATILITY_REGIME_LOOKBACK)
-    min_obs_required = max_lookback + config.LP_CONTROL_LAGS # 加1是因为shift(1)
+    # --- 修改点：移除或调整宽泛的过滤 ---
 
-    # 删除每个组开头不满足最小观测期的行
-    df_final = df_final.groupby('contract_id').filter(lambda x: len(x) >= min_obs_required)
+    # 移除或大幅弱化此处的 dropna
+    # # 准备实际存在的控制变量列表
+    # existing_control_vars = [var for var in config.CONTROL_VARIABLES if var in df_final.columns]
+    # existing_regime_vars = [col for col in df_final.columns if col.startswith('market_regime_') or col.startswith('volatility_regime_')]
+    # existing_extra_vars = [var for var in [config.LIQUIDITY_PROXY_VAR, config.ALT_VOLATILITY_VAR] if var in df_final.columns]
+    # # 使用实际存在的变量进行dropna
+    # if existing_control_vars or existing_regime_vars or existing_extra_vars:
+    #     df_final.dropna(subset=existing_control_vars + existing_regime_vars + existing_extra_vars, inplace=True)
+    logging.info("跳过在 build_features.py 末尾基于所有控制变量和状态变量的宽泛 dropna。缺失值将由具体分析脚本处理。")
+
+
+    # 考虑移除或大幅降低此 filter 的要求，因为它主要针对 LP 回归
+    # max_lookback = max(config.MARKET_REGIME_LOOKBACK, config.VOLATILITY_REGIME_LOOKBACK)
+    # min_obs_required = max_lookback + config.LP_CONTROL_LAGS # 加1是因为shift(1)
+    # # 删除每个组开头不满足最小观测期的行
+    # df_final = df_final.groupby('contract_id').filter(lambda x: len(x) >= min_obs_required)
+    logging.info("跳过在 build_features.py 末尾基于 min_obs_required (主要为LP设计) 的 filter。")
+    
     # 或者，更精确地删除开头因计算产生的 NaN 行
     
     # 准备实际存在的控制变量列表
-    existing_control_vars = [var for var in config.CONTROL_VARIABLES if var in df_final.columns]
-    existing_regime_vars = [col for col in df_final.columns if col.startswith('market_regime_') or col.startswith('volatility_regime_')]
-    existing_extra_vars = [var for var in [config.LIQUIDITY_PROXY_VAR, config.ALT_VOLATILITY_VAR] if var in df_final.columns]
+    # existing_control_vars = [var for var in config.CONTROL_VARIABLES if var in df_final.columns] # 这部分不再需要，因为上面的dropna被注释了
+    # existing_regime_vars = [col for col in df_final.columns if col.startswith('market_regime_') or col.startswith('volatility_regime_')]
+    # existing_extra_vars = [var for var in [config.LIQUIDITY_PROXY_VAR, config.ALT_VOLATILITY_VAR] if var in df_final.columns]
 
-    # 使用实际存在的变量进行dropna
-    if existing_control_vars or existing_regime_vars or existing_extra_vars:
-        df_final.dropna(subset=existing_control_vars + existing_regime_vars + existing_extra_vars, inplace=True)
+    # # 使用实际存在的变量进行dropna # 这行也被注释了
+    # if existing_control_vars or existing_regime_vars or existing_extra_vars:
+    #     df_final.dropna(subset=existing_control_vars + existing_regime_vars + existing_extra_vars, inplace=True)
 
 
-    logging.info(f"最终面板数据形状: {df_final.shape}")
+    # --- 诊断：最终数据集中各合约处理前数据点 ---
+    if 'treat_date_g' in df_final.columns and not df_final.empty:
+        logging.info("--- 诊断：最终数据集中各合约处理前数据点 (df_final) ---")
+        df_final_diag = df_final.copy()
+        df_final_diag['date'] = pd.to_datetime(df_final_diag['date'])
+        df_final_diag['treat_date_g'] = pd.to_datetime(df_final_diag['treat_date_g'], errors='coerce')
+
+        # 统计最终数据中的 NaT (实际控制组)
+        final_nat_treat_date_contracts = df_final_diag[df_final_diag['treat_date_g'].isna()]['contract_id'].nunique()
+        final_nat_treat_date_rows = df_final_diag[df_final_diag['treat_date_g'].isna()].shape[0]
+        logging.info(f"最终数据集诊断：发现 {final_nat_treat_date_contracts} 个合约 ({final_nat_treat_date_rows} 行) 的 treat_date_g 为 NaT (实际控制组)。")
+
+        final_treated_contracts = df_final_diag.dropna(subset=['treat_date_g'])
+        if not final_treated_contracts.empty:
+            final_pre_treatment_counts = final_treated_contracts.groupby('contract_id').apply(
+                lambda grp: grp[grp['date'] < grp['treat_date_g'].iloc[0]].shape[0] if pd.notna(grp['treat_date_g'].iloc[0]) else 0
+            )
+            final_pre_treatment_counts.name = 'final_pre_treatment_points'
+
+            final_summary_df = final_treated_contracts[['contract_id', 'treat_date_g']].drop_duplicates(subset=['contract_id']).set_index('contract_id')
+            final_summary_df = final_summary_df.join(final_pre_treatment_counts)
+            
+            logging.info("最终数据集诊断：有实际处理日期的合约详情：")
+            for contract_id_val, row in final_summary_df.iterrows():
+                logging.info(f"  合约 {contract_id_val} (最终数据集): "
+                             f"首次处理日期 treat_date_g = {row['treat_date_g'].strftime('%Y-%m-%d') if pd.notna(row['treat_date_g']) else 'N/A'}, "
+                             f"在该日期前的数据点数 (最终) = {row['final_pre_treatment_points']}")
+            
+            critical_contracts = final_summary_df[final_summary_df['final_pre_treatment_points'] < 2]
+            if not critical_contracts.empty:
+                logging.warning(f"警告：以下合约在最终数据集中，其首次处理日期前的观测点少于2个，可能导致 DID 分析问题:")
+                for contract_id_val, row in critical_contracts.iterrows():
+                    logging.warning(f"  - 合约 {contract_id_val}: treat_date_g={row['treat_date_g'].strftime('%Y-%m-%d') if pd.notna(row['treat_date_g']) else 'N/A'}, pre_points={row['final_pre_treatment_points']}")
+        else:
+            logging.info("最终数据集诊断：没有找到具有有效 treat_date_g 的合约进行详细处理前数据点统计。")
+        logging.info("--- 完成最终数据集诊断 ---")
+    elif df_final.empty:
+        logging.warning("df_final 为空，无法进行最终数据集诊断。")
+
+    logging.info(f"最终面板数据形状 (在移除宽泛过滤和保存前): {df_final.shape}")
     if df_final.empty:
         logging.error("最终面板数据为空，请检查数据处理流程和原始数据。")
         return
@@ -431,6 +526,8 @@ def build_features():
     # 保存到 Parquet 文件
     output_path = config.PANEL_DATA_FILEPATH
     try:
+        # 在保存前记录最终形状
+        logging.info(f"最终面板数据形状 (在移除宽泛过滤和保存前): {df_final.shape}")
         df_final.to_parquet(output_path, index=False)
         logging.info(f"特征构建完成，最终面板数据已保存到: {output_path}")
     except Exception as e:

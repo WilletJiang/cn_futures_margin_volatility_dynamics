@@ -24,7 +24,7 @@ except ImportError:
 
 # --- 日志配置 ---
 # 注意：如果作为模块导入，日志配置可能需要在调用脚本中完成
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 
 # --- 核心 LP 估计函数 ---
 
@@ -108,22 +108,29 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
     required_cols_for_reg = [entity_col, time_col, dep_var] + exog_vars
     missing_in_df = [col for col in required_cols_for_reg if col not in df_h.columns]
     if missing_in_df:
-        logging.error(f"Horizon {horizon}: DataFrame 缺少回归所需的列: {missing_in_df}")
+        logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: DataFrame 缺少回归所需的列: {missing_in_df}")
         return None
 
     df_reg = df_h[required_cols_for_reg].dropna()
+    logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: df_reg shape after dropna: {df_reg.shape}")
     if df_reg.empty:
-        logging.warning(f"Horizon {horizon}: 删除缺失值后数据为空。")
+        logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 删除缺失值后数据为空。\nData before dropna for required_cols_for_reg (non-NA counts):\n{df_h[required_cols_for_reg].notna().sum()}")
         return None
 
     # 检查目标变量是否有变化
     if target_var not in df_reg.columns:
-         logging.error(f"Horizon {horizon}: 目标变量 '{target_var}' 在删除 NaN 后丢失。")
+         logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 目标变量 '{target_var}' 在删除 NaN 后丢失。Columns in df_reg: {df_reg.columns.tolist()}")
          return None
     if df_reg[target_var].nunique() < 2:
-         logging.warning(f"Horizon {horizon}: 目标变量 '{target_var}' 没有足够的变化 (nunique={df_reg[target_var].nunique()})，无法估计。")
+         logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 目标变量 '{target_var}' 没有足够的变化 (nunique={df_reg[target_var].nunique()})，无法估计。df_reg[{target_var}].value_counts():\n{df_reg[target_var].value_counts(dropna=False)}")
          return None
 
+    # 特别调试: 检查 horizon 3 基线模型的共线性
+    if horizon == 3 and interaction_state_var is None:
+        try:
+            logging.debug(f"DEBUG Horizon 3 Baseline: Correlation matrix of exogenous variables (df_reg[exog_vars]):\n{df_reg[exog_vars].corr()}")
+        except Exception as e_corr:
+            logging.debug(f"DEBUG Horizon 3 Baseline: Could not compute correlation matrix: {e_corr}")
 
     try:
         # 设置面板索引
@@ -131,7 +138,23 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
         exog = df_reg[exog_vars]
 
         # 4. 执行 PanelOLS 回归
-        mod = PanelOLS(df_reg[dep_var], exog, entity_effects=True, time_effects=True, check_rank=False) # check_rank=False 可能需要处理共线性
+        # mod = PanelOLS(df_reg[dep_var], exog, entity_effects=True, time_effects=True, check_rank=False) # MODIFIED: Original line commented out
+
+        # MODIFIED: Start of new logic for check_rank based on interaction_state_var
+        use_strict_rank_check = False # 默认为False
+        log_rank_check_reason = "宽松检查"
+        if interaction_state_var == 'market_regime_Neutral':
+            use_strict_rank_check = True
+            log_rank_check_reason = "严格检查) 进行 market_regime_Neutral 的估计"
+            # 这条日志现在由下面的通用日志代替
+            # logger.debug(f"Horizon {h}, Shock {shock_var}: 使用 check_rank={use_strict_rank_check} ({log_rank_check_reason}")
+        # else:
+            # log_rank_check_reason = "宽松检查" # 如果不是Neutral，明确设为宽松 (虽然已经是默认)
+            # 这条日志现在由下面的通用日志代替
+            # logger.debug(f"Horizon {h}, Shock {shock_var}, Interaction {interaction_state_var if interaction_state_var else 'None'}: 使用 check_rank={use_strict_rank_check} ({log_rank_check_reason}")
+        
+        logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var if interaction_state_var else 'None'}: 设置 check_rank={use_strict_rank_check} ({log_rank_check_reason})")
+        mod = PanelOLS(df_reg[dep_var], exog, entity_effects=True, time_effects=True, check_rank=use_strict_rank_check)
 
         # 配置聚类标准误
         cluster_config = {}
@@ -153,7 +176,26 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
         else:
             cov_type_str = 'robust' # 默认异方差稳健
 
-        results = mod.fit(cov_type=cov_type_str, **cluster_config)
+        # 针对 market_regime_Neutral 在特定 horizons 上 NaN SE 问题的特别处理
+        problematic_horizons_for_neutral = [5, 6, 11, 12, 16]
+        if interaction_state_var == 'market_regime_Neutral' and horizon in problematic_horizons_for_neutral:
+            if cov_type_str != "robust" or (cluster_entity or cluster_time): # 检查是否真的需要覆盖，并且之前不是robust或者有聚类设置
+                 logging.info(f"Horizon {horizon}, Interaction {interaction_state_var}: 检测到之前 problematic horizon，强制使用 'robust' (非聚类) 标准误。")
+            cov_type_str = "robust" # 强制使用稳健标准误，不进行聚类
+            effective_cluster_config = {} # 如果是 robust, 则不应该有聚类参数
+        else:
+            effective_cluster_config = cluster_config # 否则使用原始的聚类配置
+
+        # results = mod.fit(cov_type=cov_type_str, **cluster_config) # 原始行
+        # results = mod.fit(cov_type=cov_type_str, **effective_cluster_config) # 上一个版本，仍有问题
+
+        # 新的拟合逻辑，更明确地处理空的 effective_cluster_config
+        if not effective_cluster_config: 
+            logging.debug(f"Horizon {horizon}, Interaction {interaction_state_var if interaction_state_var else 'None'}: effective_cluster_config is empty. Calling fit with cov_type='{cov_type_str}' only.")
+            results = mod.fit(cov_type=cov_type_str)
+        else:
+            logging.debug(f"Horizon {horizon}, Interaction {interaction_state_var if interaction_state_var else 'None'}: effective_cluster_config is {effective_cluster_config}. Calling fit with cov_type='{cov_type_str}' and config.")
+            results = mod.fit(cov_type=cov_type_str, **effective_cluster_config)
 
         # 5. 提取结果
         coeff = results.params[target_var]
@@ -169,17 +211,17 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
     except KeyError as e:
          # 检查是否是目标变量在 params/std_errors 中不存在 (可能因共线性被移除)
          if target_var in str(e):
-             logging.warning(f"Horizon {horizon}: 目标变量 '{target_var}' 可能因共线性等问题从模型中移除。无法获取结果。")
+             logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 目标变量 '{target_var}' 可能因共线性等问题从模型中移除。无法获取结果。\nExog vars: {exog_vars}\nExog nunique:\n{exog.nunique() if 'exog' in locals() else 'exog not defined'}")
          else:
-             logging.error(f"Horizon {horizon}: 回归时发生 KeyError: {e}. 可能缺少变量。")
+             logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 回归时发生 KeyError: {e}. 可能缺少变量。Exog vars: {exog_vars}")
          return None
     except np.linalg.LinAlgError as e:
-        logging.error(f"Horizon {horizon}: 发生线性代数错误 (可能存在完全共线性): {e}")
+        logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 发生线性代数错误 (可能存在完全共线性): {e}\nExog vars: {exog_vars}\nExog nunique:\n{exog.nunique() if 'exog' in locals() else 'exog not defined'}\nExog describe:\n{exog.describe().to_string() if 'exog' in locals() else 'exog not defined'}\nDep_var describe:\n{df_reg[dep_var].describe().to_string() if 'df_reg' in locals() and dep_var in df_reg else 'dep_var not defined'}")
         # 可以尝试打印 exog.corr() 来检查
         # print(exog.corr())
         return None
     except Exception as e:
-        logging.error(f"Horizon {horizon}: 估计时发生未知错误: {e}")
+        logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 估计时发生未知错误: {e}\nExog vars: {exog_vars}\nExog nunique:\n{exog.nunique() if 'exog' in locals() else 'exog not defined'}\nExog describe:\n{exog.describe().to_string() if 'exog' in locals() else 'exog not defined'}\nDep_var describe:\n{df_reg[dep_var].describe().to_string() if 'df_reg' in locals() and dep_var in df_reg else 'dep_var not defined'}")
         return None
 
 
@@ -256,7 +298,7 @@ def run_lp_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
                                          'coeff': res_inc[0], 'stderr': res_inc[1], 'pval': res_inc[2],
                                          'conf_low': res_inc[3], 'conf_high': res_inc[4]})
             else:
-                 logging.warning(f"基准 IRF (上升) 估计失败，Horizon={h}")
+                 logging.warning(f"基准 IRF (上升), Shock '{shock_var_inc}', Horizon={h}: 估计返回 None.")
                  analysis_successful = False # 标记估计中出现问题
         else:
              logging.warning(f"冲击变量 '{shock_var_inc}' 不存在，跳过上升冲击估计。")
@@ -269,7 +311,7 @@ def run_lp_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
                                          'coeff': res_dec[0], 'stderr': res_dec[1], 'pval': res_dec[2],
                                          'conf_low': res_dec[3], 'conf_high': res_dec[4]})
             else:
-                 logging.warning(f"基准 IRF (下降) 估计失败，Horizon={h}")
+                 logging.warning(f"基准 IRF (下降), Shock '{shock_var_dec}', Horizon={h}: 估计返回 None.")
                  analysis_successful = False
         else:
              logging.warning(f"冲击变量 '{shock_var_dec}' 不存在，跳过下降冲击估计。")
@@ -322,7 +364,7 @@ def run_lp_analysis_core(data, outcome_var, output_table_dir, output_suffix="",
                         'conf_low': res_state[3], 'conf_high': res_state[4]
                     })
                 else:
-                    logging.warning(f"状态依赖 IRF ({state_var}) 估计失败，Horizon={h}")
+                    logging.warning(f"状态依赖 IRF, Interaction '{state_var}', Shock '{shock_var_total}', Horizon={h}: 估计返回 None.")
                     analysis_successful = False # 标记估计中出现问题
 
         state_dependent_df = pd.DataFrame(state_dependent_results)

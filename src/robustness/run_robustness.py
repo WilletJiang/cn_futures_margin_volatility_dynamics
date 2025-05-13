@@ -257,13 +257,174 @@ def run_subsample_analysis(base_data):
     4.3 运行子样本分析
     """
     logging.info("--- 开始稳健性检验: 子样本分析 ---")
-    # TODO: 实现按时间、合约类型、流动性、交易所过滤数据并重新运行分析
-    # 例如:
-    # df_filtered = base_data[base_data['date'] < '2020-01-01']
-    # run_did_analysis_core(df_filtered, ...)
-    # run_lp_analysis_core(df_filtered, ...)
-    logging.warning("子样本分析检验尚未完全实现。")
-    # ... 实现逻辑 ...
+    main_outcome_var = config.OUTCOME_VAR.replace('_lag1', '') # 主结果变量
+
+    # --- 定义子样本 ---
+    subsample_definitions = [
+        # --- 1. 按时间分割 ---
+        {
+            "name": "time_pre_2020", # 2020年1月1日之前
+            "filter_lambda": lambda df: df[df['date'] < pd.Timestamp('2020-01-01')],
+            "output_suffix": "_sub_pre2020"
+        },
+        {
+            "name": "time_post_2019", # 2020年1月1日及以后
+            "filter_lambda": lambda df: df[df['date'] >= pd.Timestamp('2020-01-01')],
+            "output_suffix": "_sub_post2019"
+        },
+
+        # --- 2. 按市场状态 (Market Regime) ---
+        {
+            "name": "market_bull",
+            "filter_lambda": lambda df: df[df['market_regime_Bull'] == 1],
+            "output_suffix": "_sub_bull"
+        },
+        {
+            "name": "market_bear",
+            "filter_lambda": lambda df: df[df['market_regime_Bear'] == 1],
+            "output_suffix": "_sub_bear"
+        },
+        {
+            "name": "market_neutral",
+            "filter_lambda": lambda df: df[df['market_regime_Neutral'] == 1],
+            "output_suffix": "_sub_neutral"
+        },
+
+        # --- 3. 按波动率状态 (Volatility Regime) ---
+        {
+            "name": "vol_high",
+            "filter_lambda": lambda df: df[df['volatility_regime_High'] == 1],
+            "output_suffix": "_sub_volhigh"
+        },
+        {
+            "name": "vol_low",
+            "filter_lambda": lambda df: df[df['volatility_regime_Low'] == 1],
+            "output_suffix": "_sub_vollow"
+        },
+
+        # --- 4. 按调整类型 ---
+        {
+            "name": "adj_holiday",
+            "filter_lambda": lambda df: df[df['State_HolidayAdjust'] == 1],
+            "output_suffix": "_sub_adjholiday"
+        },
+        {
+            "name": "adj_nonholiday",
+            "filter_lambda": lambda df: df[df['State_NonHolidayAdjust'] == 1],
+            "output_suffix": "_sub_adjnonholiday"
+        },
+
+        # --- 5. 按合约类别 (示例 - 请根据您的数据调整或取消注释) ---
+        # {
+        #     "name": "contract_indexfutures",
+        #     "filter_lambda": lambda df: df['contract_id'].str.startswith('IF', na=False),
+        #     "output_suffix": "_sub_idxft"
+        # },
+        # {
+        #     "name": "contract_copper",
+        #     "filter_lambda": lambda df: df['contract_id'].str.startswith('CU', na=False),
+        #     "output_suffix": "_sub_copper"
+        # },
+
+        # --- 6. 按处理组标签 (示例 - 请根据您的数据调整或取消注释) ---
+        # {
+        #     "name": "group_springfestival",
+        #     "filter_lambda": lambda df: df['treat_group_g_label'] == '春节',
+        #     "output_suffix": "_sub_springfest"
+        # },
+        # {
+        #     "name": "group_nationalday",
+        #     "filter_lambda": lambda df: df['treat_group_g_label'] == '国庆节',
+        #     "output_suffix": "_sub_nationalday"
+        # },
+    ]
+
+    # 过滤掉那些依赖于 base_data 中不存在的列的子样本定义 (更安全的做法)
+    active_subsample_definitions = []
+    for sub_def in subsample_definitions:
+        try:
+            # 尝试对一小部分数据应用 lambda 以检查列是否存在
+            _ = sub_def["filter_lambda"](base_data.head(2).copy()) # 使用 .copy() 避免 SettingWithCopyWarning
+            active_subsample_definitions.append(sub_def)
+        except KeyError as e:
+            logging.warning(f"子样本定义 '{sub_def['name']}' 因缺少列 {e} 而被跳过。请检查您的数据或子样本定义。")
+        except Exception as e:
+            logging.warning(f"子样本定义 '{sub_def['name']}' 在测试时出错 ({type(e).__name__}: {e})，将被跳过。")
+
+    if not active_subsample_definitions:
+        logging.warning("没有可运行的子样本分析定义 (可能因缺少列或配置错误)。")
+        logging.info("--- 完成稳健性检验: 子样本分析 (无操作) ---")
+        return
+
+    logging.info(f"将运行以下子样本分析: {[s['name'] for s in active_subsample_definitions]}")
+
+    for sub_def in active_subsample_definitions:
+        logging.info(f"--- 开始运行子样本分析: {sub_def['name']} ---")
+
+        try:
+            # 对完整数据的副本应用过滤器
+            sub_data = sub_def["filter_lambda"](base_data.copy())
+        except KeyError as e: # 再次捕获以防万一 (例如，如果 head(1) 测试未完全暴露问题)
+            logging.error(f"为子样本 '{sub_def['name']}' 创建数据时列缺失: {e}。跳过此子样本。")
+            continue
+        except Exception as e:
+            logging.error(f"为子样本 '{sub_def['name']}' 应用过滤器时出错: {e}。跳过此子样本。", exc_info=True)
+            continue
+
+        if sub_data.empty:
+            logging.warning(f"子样本 '{sub_def['name']}' 数据为空 (过滤后)，跳过分析。")
+            continue
+
+        logging.info(f"子样本 '{sub_def['name']}' 数据行数: {sub_data.shape[0]}, 列数: {sub_data.shape[1]}")
+
+        sub_table_dir = os.path.join(ROBUSTNESS_TABLE_DIR, f"subsample_{sub_def['name']}")
+        sub_figure_dir = os.path.join(ROBUSTNESS_FIGURE_DIR, f"subsample_{sub_def['name']}")
+        os.makedirs(sub_table_dir, exist_ok=True)
+        os.makedirs(sub_figure_dir, exist_ok=True)
+
+        output_suffix = sub_def['output_suffix']
+
+        # --- 运行 DID 分析 (子样本) ---
+        try:
+            logging.info(f"运行 DID 分析 (子样本: {sub_def['name']}, 结果变量: {main_outcome_var})...")
+            did_success = run_did_analysis_core(data=sub_data.copy(), # 传递子数据的副本
+                                                outcome_var=main_outcome_var,
+                                                output_table_dir=sub_table_dir,
+                                                output_suffix=output_suffix)
+            if did_success:
+                logging.info(f"子样本 DID 分析 ({sub_def['name']}) 核心逻辑执行成功。")
+                did_results_file = os.path.join(sub_table_dir, f"did_aggregate_results{output_suffix}.csv")
+                did_plot_file = os.path.join(sub_figure_dir, f"did_event_study_plot{output_suffix}.png")
+                if os.path.exists(did_results_file):
+                    plot_did_results_core(results_filepath=did_results_file,
+                                          output_filepath=did_plot_file,
+                                          title_suffix=f" ({sub_def['name']})")
+                else:
+                    logging.warning(f"未找到预期的 DID 结果文件 {did_results_file} ({sub_def['name']})，无法绘图。")
+            else:
+                logging.error(f"子样本 DID 分析 ({sub_def['name']}) 核心逻辑执行失败。")
+        except Exception as e:
+            logging.error(f"运行子样本 DID 分析 ({sub_def['name']}) 或绘图时出错: {e}", exc_info=True)
+
+        # --- 运行 LP-IRF 分析 (子样本) ---
+        try:
+            logging.info(f"运行 LP-IRF 分析 (子样本: {sub_def['name']}, 结果变量: {main_outcome_var})...")
+            lp_success = run_lp_analysis_core(data=sub_data.copy(), # 传递子数据的副本
+                                              outcome_var=main_outcome_var,
+                                              output_table_dir=sub_table_dir,
+                                              output_suffix=output_suffix)
+            if lp_success:
+                logging.info(f"子样本 LP-IRF 分析 ({sub_def['name']}) 核心逻辑执行成功。")
+                plot_lp_irf_results_core(table_dir=sub_table_dir,
+                                         figure_dir=sub_figure_dir,
+                                         suffix=output_suffix)
+            else:
+                logging.error(f"子样本 LP-IRF 分析 ({sub_def['name']}) 核心逻辑执行失败。")
+        except Exception as e:
+            logging.error(f"运行子样本 LP-IRF 分析 ({sub_def['name']}) 或绘图时出错: {e}", exc_info=True)
+
+        logging.info(f"--- 完成运行子样本分析: {sub_def['name']} ---")
+
     logging.info("--- 完成稳健性检验: 子样本分析 ---")
 
 
