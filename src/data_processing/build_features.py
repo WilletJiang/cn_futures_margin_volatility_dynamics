@@ -189,6 +189,7 @@ def build_features():
 
     # 处理价格和成交量中的零或负值 (重要!)
     price_cols = ['open', 'high', 'low', 'close']
+    logging.debug(f"处理前价格列描述性统计:\n{df[price_cols].describe().to_string()}")
     for col in price_cols:
         df[col] = df[col].replace(0, np.nan) # 假设 0 是无效价格
         df[col] = df[col].apply(lambda x: x if x > 0 else np.nan)
@@ -219,6 +220,7 @@ def build_features():
     df.dropna(subset=fill_cols, inplace=True) # 删除仍有关键信息缺失的行
 
     logging.info(f"数据清洗后形状: {df.shape}")
+    logging.debug(f"数据清洗后关键列的缺失值计数:\n{df[fill_cols].isnull().sum().to_string()}")
     if df.empty:
         logging.error("数据清洗后为空，请检查原始数据质量和处理步骤。")
         return
@@ -278,6 +280,15 @@ def build_features():
     df['return'] = np.log(df['close'] / df['close_lag1'])
     df['return'].fillna(0, inplace=True) # 第一期收益率为 0
 
+    logging.info(f"核心变量计算后形状: {df.shape}")
+    core_vars_to_check = ['log_gk_volatility', 'dlog_margin_rate', 'margin_increase_shock', 'margin_decrease_shock', 'turnover_rate', 'return']
+    for var in core_vars_to_check:
+        if var in df.columns:
+            logging.debug(f"核心变量 '{var}' 描述性统计:\n{df[var].describe().to_string()}")
+            logging.debug(f"核心变量 '{var}' 缺失值数量: {df[var].isnull().sum()}")
+        else:
+            logging.warning(f"核心变量 '{var}' 在计算后未找到。")
+
     # --- 4. 计算状态变量 (使用 t-1 信息) ---
     logging.info("计算状态变量...")
 
@@ -307,6 +318,14 @@ def build_features():
     for col in df.columns:
         if col.startswith('volatility_regime_'):
             df[col] = df[col].astype(int)
+
+    logging.info(f"状态变量计算后形状: {df.shape}")
+    market_regime_cols = [col for col in df.columns if col.startswith('market_regime_')]
+    if market_regime_cols:
+        logging.debug(f"市场状态变量分布:\n{df[market_regime_cols].sum().to_string()}")
+    vol_regime_cols = [col for col in df.columns if col.startswith('volatility_regime_')]
+    if vol_regime_cols:
+        logging.debug(f"波动率状态变量分布:\n{df[vol_regime_cols].sum().to_string()}")
 
     # --- 5. 创建 DID 相关变量 ---
     logging.info("创建 DID 相关变量...")
@@ -393,6 +412,15 @@ def build_features():
     df['State_HolidayAdjust'] = df['is_holiday_adjustment_day'].astype(int)
     df['State_NonHolidayAdjust'] = ((df['holiday_window_label'] == '') & (np.abs(df['dlog_margin_rate']) > 1e-8)).astype(int)
 
+    logging.info(f"DID 及调整类型状态变量计算后形状: {df.shape}")
+    if 'is_holiday_adjustment_day' in df.columns:
+        logging.debug(f"'is_holiday_adjustment_day' 计数: {df['is_holiday_adjustment_day'].sum()}")
+    if 'State_HolidayAdjust' in df.columns:
+        logging.debug(f"'State_HolidayAdjust' 计数: {df['State_HolidayAdjust'].sum()}")
+    if 'State_NonHolidayAdjust' in df.columns:
+        logging.debug(f"'State_NonHolidayAdjust' 计数: {df['State_NonHolidayAdjust'].sum()}")
+    if 'treat_date_g' in df.columns:
+        logging.debug(f"合约中 'treat_date_g' 为 NaT (未处理) 的数量: {df['treat_date_g'].isnull().groupby(df['contract_id']).all().sum()} / {df['contract_id'].nunique()} 总合约数")
 
     # --- 6. 创建滞后控制变量 ---
     logging.info("创建滞后控制变量...")
@@ -443,11 +471,18 @@ def build_features():
     final_columns.extend([col for col in df.columns if col.startswith('market_regime_') and col not in final_columns])
     final_columns.extend([col for col in df.columns if col.startswith('volatility_regime_') and col not in final_columns])
 
+    # 显式添加 variety 和 variety_type 列（如果存在）
+    if 'variety' in df.columns and 'variety' not in final_columns:
+        final_columns.append('variety')
+    if 'variety_type' in df.columns and 'variety_type' not in final_columns:
+        final_columns.append('variety_type')
+
     # 去重并保留存在的列
     final_columns = sorted(list(set(col for col in final_columns if col in df.columns)))
     df_final = df[final_columns].copy()
 
     # --- 修改点：移除或调整宽泛的过滤 ---
+    logging.info(f"进入最终清理前 df_final 形状: {df_final.shape}")
 
     # 移除或大幅弱化此处的 dropna
     # # 准备实际存在的控制变量列表
@@ -458,8 +493,7 @@ def build_features():
     # if existing_control_vars or existing_regime_vars or existing_extra_vars:
     #     df_final.dropna(subset=existing_control_vars + existing_regime_vars + existing_extra_vars, inplace=True)
     logging.info("跳过在 build_features.py 末尾基于所有控制变量和状态变量的宽泛 dropna。缺失值将由具体分析脚本处理。")
-
-
+    
     # 考虑移除或大幅降低此 filter 的要求，因为它主要针对 LP 回归
     # max_lookback = max(config.MARKET_REGIME_LOOKBACK, config.VOLATILITY_REGIME_LOOKBACK)
     # min_obs_required = max_lookback + config.LP_CONTROL_LAGS # 加1是因为shift(1)
@@ -507,9 +541,17 @@ def build_features():
                              f"首次处理日期 treat_date_g = {row['treat_date_g'].strftime('%Y-%m-%d') if pd.notna(row['treat_date_g']) else 'N/A'}, "
                              f"在该日期前的数据点数 (最终) = {row['final_pre_treatment_points']}")
             
-            critical_contracts = final_summary_df[final_summary_df['final_pre_treatment_points'] < 2]
+            # critical_contracts = final_summary_df[final_summary_df['final_pre_treatment_points'] < config.MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK if hasattr(config, 'MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK') else 2] # 使用config中的值或默认值2
+            # --- 修改：明确比较值 --- 
+            min_obs_val = 2 # 默认值
+            if hasattr(config, 'MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK'):
+                min_obs_val = config.MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK
+            logging.info(f"用于筛选 critical_contracts 的最小观测点阈值 (min_obs_val): {min_obs_val}")
+            
+            critical_contracts = final_summary_df[final_summary_df['final_pre_treatment_points'] < min_obs_val]
+            # --- 结束修改 ---
             if not critical_contracts.empty:
-                logging.warning(f"警告：以下合约在最终数据集中，其首次处理日期前的观测点少于2个，可能导致 DID 分析问题:")
+                logging.warning(f"警告：以下合约在最终数据集中，其首次处理日期前的观测点少于 {min_obs_val} 个，可能导致 DID 分析问题:")
                 for contract_id_val, row in critical_contracts.iterrows():
                     logging.warning(f"  - 合约 {contract_id_val}: treat_date_g={row['treat_date_g'].strftime('%Y-%m-%d') if pd.notna(row['treat_date_g']) else 'N/A'}, pre_points={row['final_pre_treatment_points']}")
         else:
@@ -528,6 +570,10 @@ def build_features():
     try:
         # 在保存前记录最终形状
         logging.info(f"最终面板数据形状 (在移除宽泛过滤和保存前): {df_final.shape}")
+        if not df_final.empty:
+            logging.debug(f"最终面板数据 (df_final) 描述性统计 (部分关键列):\n{df_final[['log_gk_volatility', 'dlog_margin_rate'] + [col for col in market_regime_cols if col in df_final.columns] + [col for col in vol_regime_cols if col in df_final.columns] ].describe(include='all').to_string()}")
+            logging.debug(f"最终面板数据 (df_final) 缺失值统计 (部分关键列):\n{df_final[['log_gk_volatility', 'dlog_margin_rate'] + [col for col in market_regime_cols if col in df_final.columns] + [col for col in vol_regime_cols if col in df_final.columns] ].isnull().sum().to_string()}")
+        
         df_final.to_parquet(output_path, index=False)
         logging.info(f"特征构建完成，最终面板数据已保存到: {output_path}")
     except Exception as e:

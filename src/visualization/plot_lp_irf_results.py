@@ -208,3 +208,64 @@ if __name__ == "__main__":
     plot_lp_irf_core(table_dir=config.PATH_OUTPUT_TABLES,
                      figure_dir=config.PATH_OUTPUT_FIGURES,
                      suffix="")
+
+    # --- 为流动性机制检验结果绘图 ---
+    logging.info("为流动性机制检验 (换手率) 的 LP-IRF 结果生成图表...")
+    plot_lp_irf_core(table_dir=config.PATH_OUTPUT_TABLES,
+                     figure_dir=config.PATH_OUTPUT_FIGURES,
+                     suffix="_liquidity_turnover")
+
+    logging.info("为流动性机制检验 (对数成交量) 的 LP-IRF 结果生成图表...")
+    plot_lp_irf_core(table_dir=config.PATH_OUTPUT_TABLES,
+                     figure_dir=config.PATH_OUTPUT_FIGURES,
+                     suffix="_liquidity_logvolume")
+
+    # --- 为排除极端冲击的敏感性分析结果绘图 ---
+    logging.info("为排除极端冲击的敏感性分析的 LP-IRF 结果生成图表...")
+    plot_lp_irf_core(table_dir=config.PATH_OUTPUT_TABLES,
+                     figure_dir=config.PATH_OUTPUT_FIGURES,
+                     suffix="_trimmed_shocks")
+
+    # --- 为按品种类型分解的敏感性分析结果绘图 ---
+    logging.info("为按品种类型分解的敏感性分析的 LP-IRF 结果生成图表...")
+    try:
+        if not os.path.exists(config.PANEL_DATA_FILEPATH):
+            logging.warning(f"主面板数据文件未找到: {config.PANEL_DATA_FILEPATH}，无法确定品种类型以绘图。")
+        else:
+            main_df_plot_variety = pd.read_parquet(config.PANEL_DATA_FILEPATH)
+            variety_type_col = 'variety' # 更新为 'variety' 以匹配 lp_irf_analysis.py
+            if variety_type_col not in main_df_plot_variety.columns:
+                logging.warning(f"品种列 '{variety_type_col}' 不在数据中，无法为按品种分解的结果绘图。")
+            else:
+                unique_varieties_plot = main_df_plot_variety[variety_type_col].unique()
+                for variety_plot in unique_varieties_plot:
+                    if pd.isna(variety_plot):
+                        continue # 跳过缺失
+                    
+                    df_subset_plot_check = main_df_plot_variety[main_df_plot_variety[variety_type_col] == variety_plot]
+                    if df_subset_plot_check.empty or len(df_subset_plot_check) < 100: # 与 lp_irf_analysis.py 中条件一致
+                        logging.info(f"品种类型 '{variety_plot}' 数据子集过小，可能未生成分析结果，跳过绘图。")
+                        continue
+
+                    safe_variety_suffix_plot = "".join(filter(str.isalnum, str(variety_plot)))
+                    if not safe_variety_suffix_plot:
+                         safe_variety_suffix_plot = f"unknownvariety_{hash(variety_plot) % 1000}"
+                    
+                    plot_suffix_variety = f"_vt_{safe_variety_suffix_plot}"
+                    
+                    # 检查对应的结果文件是否存在，避免对未成功运行的分析尝试绘图
+                    baseline_results_filename = f"lp_irf_results_baseline{plot_suffix_variety}.csv"
+                    baseline_results_path = os.path.join(config.PATH_OUTPUT_TABLES, baseline_results_filename)
+                    statedep_results_filename = f"lp_irf_results_statedep{plot_suffix_variety}.csv"
+                    statedep_results_path = os.path.join(config.PATH_OUTPUT_TABLES, statedep_results_filename)
+
+                    if not os.path.exists(baseline_results_path) and not os.path.exists(statedep_results_path):
+                        logging.info(f"未找到品种 '{variety_plot}' (后缀 {plot_suffix_variety}) 的LP-IRF结果文件，跳过绘图。")
+                        continue
+
+                    logging.info(f"为品种 '{variety_plot}' (后缀 {plot_suffix_variety}) 的 LP-IRF 结果生成图表...")
+                    plot_lp_irf_core(table_dir=config.PATH_OUTPUT_TABLES,
+                                     figure_dir=config.PATH_OUTPUT_FIGURES,
+                                     suffix=plot_suffix_variety)
+    except Exception as e:
+        logging.error(f"为按品种类型分解的结果绘图时发生错误: {e}")

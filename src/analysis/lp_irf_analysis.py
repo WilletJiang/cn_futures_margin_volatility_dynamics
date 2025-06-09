@@ -111,10 +111,14 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
         logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: DataFrame 缺少回归所需的列: {missing_in_df}")
         return None
 
-    df_reg = df_h[required_cols_for_reg].dropna()
-    logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: df_reg shape after dropna: {df_reg.shape}")
+    df_reg = df_h[required_cols_for_reg].copy() # MODIFIED: Added .copy() to avoid SettingWithCopyWarning
+    logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: df_reg shape BEFORE dropna: {df_reg.shape}")
+    logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Non-NA counts BEFORE dropna for required_cols_for_reg:\\n{df_reg.notna().sum()}")
+
+    df_reg.dropna(inplace=True) # MODIFIED: Changed from df_reg = df_h[...].dropna() to operate on the copy
+    logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: df_reg shape AFTER dropna: {df_reg.shape}")
     if df_reg.empty:
-        logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 删除缺失值后数据为空。\nData before dropna for required_cols_for_reg (non-NA counts):\n{df_h[required_cols_for_reg].notna().sum()}")
+        logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 删除缺失值后数据为空。")
         return None
 
     # 检查目标变量是否有变化
@@ -136,6 +140,51 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
         # 设置面板索引
         df_reg = df_reg.set_index([entity_col, time_col])
         exog = df_reg[exog_vars]
+
+        # --- 调试：检查解释变量 ---
+        logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Exogenous variables being used: {exog_vars}")
+        for var in exog_vars:
+            if var in exog.columns:
+                logging.debug(f"  Var '{var}': nunique={exog[var].nunique()}, dtype={exog[var].dtype}, non_na_count={exog[var].notna().sum()}")
+                if exog[var].nunique() < 2 and exog[var].notna().sum() > 0 : # 如果变量存在但没有变化 (例如全是0或全是同一个值)
+                     logging.warning(f"  WARNING Var '{var}': has {exog[var].nunique()} unique values but {exog[var].notna().sum()} non-NA observations. This could cause perfect collinearity or an intercept-only like variable.")
+                     logging.debug(f"    Value counts for '{var}':\\n{exog[var].value_counts(dropna=False).to_string()}")
+            else:
+                logging.error(f"  Var '{var}' specified in exog_vars but not found in exog DataFrame columns after set_index and selection.")
+        
+        # --- 调试：计算条件数 ---
+        try:
+            if not exog.empty and exog.shape[1] > 0: # 确保 exog 不为空且有列
+                # 确保所有列都是数值类型，对于 PanelOLS 通常会自动处理，但条件数计算需要显式数值
+                exog_numeric = exog.select_dtypes(include=np.number)
+                if exog_numeric.shape[1] < exog.shape[1]:
+                    logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Not all exogenous variables are numeric for condition number calculation. Original exog columns: {exog.columns.tolist()}, Numeric exog columns: {exog_numeric.columns.tolist()}")
+                
+                if not exog_numeric.empty and exog_numeric.shape[1] > 0:
+                    # 添加常数项以模拟回归中的截距（如果模型有截距且未被固定效应吸收）
+                    # PanelOLS 通常自己处理截距和固定效应，这里我们只看解释变量自身的共线性
+                    # X = sm.add_constant(exog_numeric, prepend=True) if not entity_effects and not time_effects else exog_numeric # 根据是否有固定效应决定是否加常数
+                    # 考虑到 PanelOLS 会处理固定效应，我们主要关注 exog_vars 之间的共线性。
+                    # 如果 exog_vars 包含了一个接近常数的列 (除了固定效应之外)，那也会有问题。
+                    X_for_cond = exog_numeric.copy()
+                    # 检查是否存在方差为0的列 (常数项)
+                    constant_cols = X_for_cond.columns[X_for_cond.var() < 1e-10] # 方差极小的列
+                    if len(constant_cols) > 0:
+                        logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Exogenous variables include constant-like columns (after selecting numeric): {constant_cols.tolist()}. This will lead to perfect collinearity if not handled by fixed effects.")
+                        # 尝试移除这些列再计算条件数，但这可能改变模型
+                        # X_for_cond = X_for_cond.drop(columns=constant_cols)
+                    
+                    if not X_for_cond.empty and X_for_cond.shape[1] > 0:
+                        condition_number = np.linalg.cond(X_for_cond)
+                        logging.info(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Condition number of exogenous variables (numeric part): {condition_number:.2f}")
+                        if condition_number > 30: # 一个常用的经验阈值
+                            logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: High condition number ({condition_number:.2f}) suggests potential multicollinearity.")
+                    else:
+                        logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Exogenous numeric matrix for condition number is empty or has no columns after filtering constant-like columns.")
+                else:
+                    logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: No numeric exogenous variables to calculate condition number.")
+        except Exception as e_cond:
+            logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Error calculating condition number: {e_cond}")
 
         # 4. 执行 PanelOLS 回归
         # mod = PanelOLS(df_reg[dep_var], exog, entity_effects=True, time_effects=True, check_rank=False) # MODIFIED: Original line commented out
@@ -211,17 +260,21 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
     except KeyError as e:
          # 检查是否是目标变量在 params/std_errors 中不存在 (可能因共线性被移除)
          if target_var in str(e):
-             logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 目标变量 '{target_var}' 可能因共线性等问题从模型中移除。无法获取结果。\nExog vars: {exog_vars}\nExog nunique:\n{exog.nunique() if 'exog' in locals() else 'exog not defined'}")
+             logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 目标变量 '{target_var}' 可能因共线性等问题从模型中移除。无法获取结果。\\nExog vars: {exog_vars}\\nExog nunique:\\n{exog.nunique().to_string() if 'exog' in locals() and hasattr(exog, 'nunique') else 'exog not defined or nunique failed'}\\nExog info:\\n{exog.info() if 'exog' in locals() and hasattr(exog, 'info') else 'exog not defined or info failed'}")
          else:
              logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 回归时发生 KeyError: {e}. 可能缺少变量。Exog vars: {exog_vars}")
          return None
     except np.linalg.LinAlgError as e:
-        logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 发生线性代数错误 (可能存在完全共线性): {e}\nExog vars: {exog_vars}\nExog nunique:\n{exog.nunique() if 'exog' in locals() else 'exog not defined'}\nExog describe:\n{exog.describe().to_string() if 'exog' in locals() else 'exog not defined'}\nDep_var describe:\n{df_reg[dep_var].describe().to_string() if 'df_reg' in locals() and dep_var in df_reg else 'dep_var not defined'}")
+        logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 发生线性代数错误 (可能存在完全共线性): {e}\\nExog vars: {exog_vars}\\nExog nunique:\\n{exog.nunique().to_string() if 'exog' in locals() and hasattr(exog, 'nunique') else 'exog not defined or nunique failed'}\\nExog describe:\\n{exog.describe().to_string() if 'exog' in locals() and hasattr(exog, 'describe') else 'exog not defined or describe failed'}\\nDep_var describe:\\n{df_reg[dep_var].describe().to_string() if 'df_reg' in locals() and dep_var in df_reg and hasattr(df_reg[dep_var], 'describe') else 'dep_var not defined or describe failed'}")
         # 可以尝试打印 exog.corr() 来检查
-        # print(exog.corr())
+        if 'exog' in locals() and hasattr(exog, 'corr'):
+            try:
+                logging.error(f"Exog correlation matrix:\\n{exog.corr().to_string()}")
+            except Exception as e_corr_print:
+                logging.error(f"Could not print exog correlation matrix: {e_corr_print}")
         return None
     except Exception as e:
-        logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 估计时发生未知错误: {e}\nExog vars: {exog_vars}\nExog nunique:\n{exog.nunique() if 'exog' in locals() else 'exog not defined'}\nExog describe:\n{exog.describe().to_string() if 'exog' in locals() else 'exog not defined'}\nDep_var describe:\n{df_reg[dep_var].describe().to_string() if 'df_reg' in locals() and dep_var in df_reg else 'dep_var not defined'}")
+        logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: 估计时发生未知错误: {e}\\nExog vars: {exog_vars}\\nExog nunique:\\n{exog.nunique().to_string() if 'exog' in locals() and hasattr(exog, 'nunique') else 'exog not defined or nunique failed'}\\nExog describe:\\n{exog.describe().to_string() if 'exog' in locals() and hasattr(exog, 'describe') else 'exog not defined or describe failed'}\\nDep_var describe:\\n{df_reg[dep_var].describe().to_string() if 'df_reg' in locals() and dep_var in df_reg and hasattr(df_reg[dep_var], 'describe') else 'dep_var not defined or describe failed'}")
         return None
 
 
@@ -410,3 +463,165 @@ if __name__ == "__main__":
 
     except Exception as e:
         logging.error(f"直接运行 LP 分析时出错: {e}")
+
+    # --- 流动性机制检验 ---
+    # Outcome: turnover_rate
+    try:
+        if not os.path.exists(config.PANEL_DATA_FILEPATH):
+             logging.error(f"主面板数据文件未找到: {config.PANEL_DATA_FILEPATH}")
+             exit()
+        main_df_liq_tr = pd.read_parquet(config.PANEL_DATA_FILEPATH)
+        main_df_liq_tr['date'] = pd.to_datetime(main_df_liq_tr['date'])
+        # 确保 turnover_rate 存在
+        turnover_rate_var = config.LIQUIDITY_PROXY_VAR.replace('_lag1', '') # 'turnover_rate'
+        if turnover_rate_var not in main_df_liq_tr.columns:
+            logging.error(f"流动性指标 '{turnover_rate_var}' 不在数据中，无法进行分析。")
+        else:
+            logging.info(f"--- 开始流动性机制检验 (Outcome: {turnover_rate_var}) ---")
+            success_liq_tr = run_lp_analysis_core(
+                data=main_df_liq_tr,
+                outcome_var=turnover_rate_var,
+                output_table_dir=config.PATH_OUTPUT_TABLES,
+                output_suffix="_liquidity_turnover", # 新的后缀
+                # shock_var_inc, shock_var_dec, shock_var_total, controls, lp_horizon 使用默认值
+            )
+            if success_liq_tr:
+                logging.info(f"LP 分析 (Outcome: {turnover_rate_var}) 成功完成。")
+            else:
+                logging.error(f"LP 分析 (Outcome: {turnover_rate_var}) 执行过程中出现错误。")
+    except Exception as e:
+        logging.error(f"运行 LP 分析 (Outcome: turnover_rate) 时出错: {e}")
+
+    # Outcome: log_volume
+    try:
+        if not os.path.exists(config.PANEL_DATA_FILEPATH):
+             logging.error(f"主面板数据文件未找到: {config.PANEL_DATA_FILEPATH}")
+             exit()
+        main_df_liq_lv = pd.read_parquet(config.PANEL_DATA_FILEPATH)
+        main_df_liq_lv['date'] = pd.to_datetime(main_df_liq_lv['date'])
+        log_volume_var = 'log_volume'
+        if log_volume_var not in main_df_liq_lv.columns:
+            logging.error(f"流动性指标 '{log_volume_var}' 不在数据中，无法进行分析。")
+        else:
+            logging.info(f"--- 开始流动性机制检验 (Outcome: {log_volume_var}) ---")
+            success_liq_lv = run_lp_analysis_core(
+                data=main_df_liq_lv,
+                outcome_var=log_volume_var,
+                output_table_dir=config.PATH_OUTPUT_TABLES,
+                output_suffix="_liquidity_logvolume", # 新的后缀
+            )
+            if success_liq_lv:
+                logging.info(f"LP 分析 (Outcome: {log_volume_var}) 成功完成。")
+            else:
+                logging.error(f"LP 分析 (Outcome: {log_volume_var}) 执行过程中出现错误。")
+    except Exception as e:
+        logging.error(f"运行 LP 分析 (Outcome: {log_volume_var}) 时出错: {e}")
+
+    # --- 敏感性分析：排除极端冲击 ---
+    try:
+        if not os.path.exists(config.PANEL_DATA_FILEPATH):
+            logging.error(f"主面板数据文件未找到: {config.PANEL_DATA_FILEPATH}")
+            exit()
+        main_df_trimmed = pd.read_parquet(config.PANEL_DATA_FILEPATH)
+        main_df_trimmed['date'] = pd.to_datetime(main_df_trimmed['date'])
+
+        # 识别极端冲击 (dlog_margin_rate 绝对值最大的 1%)
+        # 确保 dlog_margin_rate 存在
+        if 'dlog_margin_rate' not in main_df_trimmed.columns:
+            logging.error("'dlog_margin_rate' 列不在数据中，无法进行极端冲击排除。")
+        else:
+            logging.info("--- 开始敏感性分析：排除极端保证金率变动冲击 ---")
+            abs_dlog_margin = main_df_trimmed['dlog_margin_rate'].abs()
+            
+            # 改进的极端冲击阈值计算逻辑
+            non_zero_abs_shocks = abs_dlog_margin[abs_dlog_margin > 1e-10] # 考虑浮点精度的小容差
+            
+            if non_zero_abs_shocks.empty:
+                logging.warning("数据中没有发现非零的保证金率变动，跳过极端冲击排除分析。")
+                threshold = 0 # 使得后续过滤保留所有数据（如果都为0）
+                df_filtered_shocks = main_df_trimmed.copy() # 无需过滤
+            else:
+                threshold = non_zero_abs_shocks.quantile(0.99)
+                logging.info(f"极端冲击阈值 (基于非零冲击的99th percentile of absolute dlog_margin_rate): {threshold:.6f}")
+                # 过滤：保留冲击小于阈值的，或冲击为零的
+                df_filtered_shocks = main_df_trimmed[(abs_dlog_margin < threshold) | (abs_dlog_margin < 1e-10)].copy()
+
+            logging.info(f"原始数据行数: {len(main_df_trimmed)}, 排除极端冲击后行数: {len(df_filtered_shocks)}")
+
+            if len(df_filtered_shocks) < 0.5 * len(main_df_trimmed) or df_filtered_shocks.empty:
+                logging.warning("排除极端冲击后数据量过少或为空，跳过此项敏感性分析。")
+            else:
+                # 在过滤后的数据上重新定义冲击变量 (如果需要，尽管 run_lp_analysis_core 主要看 shock_var_inc/dec)
+                # 对于基准分析，我们通常传入 shock_var_inc 和 shock_var_dec。
+                # 我们需要确保这些冲击变量在过滤后的 df_filtered_shocks 中也相应调整。
+                # run_lp_analysis_core 会使用传入的 shock_var_inc/dec 列名，所以这些列必须存在于 data 参数中。
+                # 如果原始的 shock_var_inc/dec 是基于 dlog_margin_rate 计算的，那么在过滤行之后，这些列的值依然有效。
+                # 或者，我们可以仅对 dlog_margin_rate 进行操作，然后让 estimate_lp_horizon 基于这个新的 dlog_margin_rate
+                # （如果它支持从一个总冲击变量生成 inc/dec）。但目前 estimate_lp_horizon 是直接用 shock_var。
+                # 因此，只要过滤后的 df_filtered_shocks 中保留了原有的 margin_increase_shock 和 margin_decrease_shock 列即可。
+                # 这些列的值本身已经是基于原始 dlog_margin_rate 计算的。
+                # 过滤掉了包含极端 dlog_margin_rate 的行，也就过滤掉了相应的极端 increase/decrease shock。
+
+                success_trimmed = run_lp_analysis_core(
+                    data=df_filtered_shocks,
+                    outcome_var='log_gk_volatility', # 结果变量仍是波动率
+                    output_table_dir=config.PATH_OUTPUT_TABLES,
+                    output_suffix="_trimmed_shocks",
+                    # shock_var_inc, shock_var_dec 等使用默认，它们应该存在于 df_filtered_shocks 中
+                )
+                if success_trimmed:
+                    logging.info("LP 分析 (排除极端冲击) 成功完成。")
+                else:
+                    logging.error("LP 分析 (排除极端冲击) 执行过程中出现错误。")
+
+    except Exception as e:
+        logging.error(f"运行 LP 分析 (排除极端冲击) 时出错: {e}")
+
+    # --- 敏感性分析：按品种类型分解 ---
+    try:
+        if not os.path.exists(config.PANEL_DATA_FILEPATH):
+            logging.error(f"主面板数据文件未找到: {config.PANEL_DATA_FILEPATH}")
+            exit()
+        main_df_variety = pd.read_parquet(config.PANEL_DATA_FILEPATH)
+        main_df_variety['date'] = pd.to_datetime(main_df_variety['date'])
+
+        variety_type_col = 'variety' 
+        if variety_type_col not in main_df_variety.columns:
+            logging.warning(f"品种类型列 '{variety_type_col}' 不在数据中，跳过按品种分解的敏感性分析。")
+        else:
+            unique_varieties = main_df_variety[variety_type_col].unique()
+            logging.info(f"--- 开始敏感性分析：按品种类型分解 (发现品种: {unique_varieties}) ---")
+
+            for variety in unique_varieties:
+                if pd.isna(variety): # 跳过缺失的品种类型
+                    logging.info(f"跳过缺失的品种类型 (NaN)")
+                    continue
+                
+                logging.info(f"处理品种类型: {variety}")
+                df_subset = main_df_variety[main_df_variety[variety_type_col] == variety].copy()
+
+                if df_subset.empty or len(df_subset) < 100: # 如果子集太小，可能无法进行稳健估计
+                    logging.warning(f"品种类型 '{variety}' 的数据子集太小 (行数: {len(df_subset)})，跳过分析。")
+                    continue
+
+                # 清理品种名称以用作文件名后缀 (移除非字母数字字符)
+                safe_variety_suffix = "".join(filter(str.isalnum, str(variety)))
+                if not safe_variety_suffix: # 如果清理后为空，使用通用后缀
+                    safe_variety_suffix = f"unknownvariety_{hash(variety) % 1000}"
+                
+                output_suffix_variety = f"_vt_{safe_variety_suffix}"
+
+                logging.info(f"运行品种 '{variety}' (后缀: {output_suffix_variety}) 的 LP 分析...")
+                success_variety = run_lp_analysis_core(
+                    data=df_subset,
+                    outcome_var='log_gk_volatility',
+                    output_table_dir=config.PATH_OUTPUT_TABLES,
+                    output_suffix=output_suffix_variety,
+                )
+                if success_variety:
+                    logging.info(f"LP 分析 (品种: {variety}) 成功完成。")
+                else:
+                    logging.error(f"LP 分析 (品种: {variety}) 执行过程中出现错误。")
+
+    except Exception as e:
+        logging.error(f"运行 LP 分析 (按品种类型分解) 时出错: {e}")
