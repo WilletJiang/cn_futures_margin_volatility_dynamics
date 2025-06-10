@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Research](https://img.shields.io/badge/Research-Academic-orange.svg)](https://github.com)
 
-本项目是一个关于期货保证金调整对市场波动率动态影响的学术研究项目。采用局部投影脉冲响应函数（LP-IRF）和事件研究方法，深入分析中国期货市场中保证金政策变化的市场效应。
+本项目是一个关于期货保证金调整对市场波动率动态影响的学术研究项目。采用局部投影脉冲响应函数（LP-IRF）和事件研究方法，分析中国期货市场中保证金政策变化的市场效应。
 
 ## 项目概述
 
@@ -292,10 +292,10 @@ SOFTWARE.
 
 ```bibtex
 @software{futures_margin_volatility_dynamics,
-  title={期货保证金波动动态研究},
-  author={[作者姓名]},
+  title={中国期货保证金波动动态研究},
+  author={[XXX]},
   year={2024},
-  url={https://github.com/[username]/futures_margin_volatility_dynamics},
-  note={期货保证金调整对市场波动率动态影响的实证研究}
+  url={https://github.com/willetjiang/futures_margin_volatility_dynamics},
+  note={中国期货保证金调整对市场波动率动态影响的实证研究}
 }
 ```
