@@ -152,7 +152,25 @@ MARGIN_RATE_COLUMN = "margin_rate" # 假设原始数据中有此列名，或需�
 # DID分析中要求的最小处理前观测点数
 MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK = 5  # 至少需要5个处理前观测点
 
-# --- 10. 其他 ---
+# --- 10. 事件研究参数 ---
+# 事件窗口定义 (相对于事件日的天数)
+EVENT_STUDY_PRE_WINDOW = 10    # 事件前窗口期 (t=-10)
+EVENT_STUDY_POST_WINDOW = 10   # 事件后窗口期 (t=+10)
+EVENT_STUDY_ESTIMATION_WINDOW = 120  # 估计窗口期长度 (用于计算正常收益率)
+EVENT_STUDY_GAP_DAYS = 5       # 估计窗口与事件窗口之间的间隔天数
+
+# 事件研究中的最小观测要求
+EVENT_STUDY_MIN_ESTIMATION_OBS = 60  # 估计窗口最少观测数
+EVENT_STUDY_MIN_EVENT_GAP = 30       # 两个事件之间的最小间隔天数 (避免重叠)
+
+# 异常收益率计算方法
+EVENT_STUDY_NORMAL_RETURN_MODEL = "market_model"  # "market_model", "mean_adjusted", "market_adjusted"
+
+# 统计检验参数
+EVENT_STUDY_SIGNIFICANCE_LEVEL = 0.05  # 显著性水平
+EVENT_STUDY_BOOTSTRAP_ITERATIONS = 1000  # Bootstrap检验迭代次数
+
+# --- 11. 其他 ---
 # 绘图风格
 PLOT_STYLE = "seaborn-v0_8-darkgrid"
 

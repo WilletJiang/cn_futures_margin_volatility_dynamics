@@ -25,14 +25,10 @@ if [ $? -ne 0 ]; then
 fi
 echo "描述性统计表格生成完成。"
 
-# 步骤 3: 运行核心分析 (DID 和 LP-IRF)
-echo "\n[步骤 3/5] 运行核心分析..."
-echo "  - 运行 DID 分析 (did_cs_analysis.py)..."
-# python src/analysis/did_cs_analysis_multi_event.py
-echo "DID 分析已被废弃。"
-
+# 步骤 3: 运行核心分析 (LP-IRF)
 echo "  - 运行 LP-IRF 分析 (lp_irf_analysis.py)..."
 python src/analysis/lp_irf_analysis.py
+python src/analysis/run_event_study.py
 if [ $? -ne 0 ]; then
     echo "错误：LP-IRF 分析失败，脚本终止。"
     exit 1
@@ -40,10 +36,6 @@ fi
 echo "核心分析完成。"
 
 # 步骤 4: 生成核心分析结果的可视化图表
-echo "\n[步骤 4/5] 生成可视化图表..."
-echo "  - 生成 DID 事件研究图 (plot_did_results.py)..."
-echo "DID 图表已被废弃。"
-
 echo "  - 生成 LP-IRF 图 (plot_lp_irf_results.py)..."
 python src/visualization/plot_lp_irf_results.py
 if [ $? -ne 0 ]; then

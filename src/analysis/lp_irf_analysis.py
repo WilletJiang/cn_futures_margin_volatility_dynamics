@@ -220,27 +220,12 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
                 condition_number = np.linalg.cond(exog)
                 logging.debug(f"Horizon {horizon}: 设计矩阵条件数: {condition_number:.2f}")
                 
-                # 如果条件数过高，尝试岭回归正则化
+                # 如果条件数过高，使用标准化处理
                 if condition_number > 100:
                     logging.warning(f"Horizon {horizon}: 条件数过高 ({condition_number:.2f})，将使用数值稳定化处理")
-                    # 添加微小的岭正则化到对角线
-                    ridge_param = 1e-6
-                    exog_stabilized = exog.copy()
-                    # 对数据进行标准化以提高数值稳定性
-                    from sklearn.preprocessing import StandardScaler
-                    try:
-                        scaler = StandardScaler()
-                        exog_scaled = pd.DataFrame(
-                            scaler.fit_transform(exog_stabilized),
-                            index=exog_stabilized.index,
-                            columns=exog_stabilized.columns
-                        )
-                        exog = exog_scaled
-                        logging.debug(f"Horizon {horizon}: 已对解释变量进行标准化处理")
-                    except:
-                        # 如果sklearn不可用，使用简单的标准化
-                        exog = (exog - exog.mean()) / (exog.std() + 1e-8)
-                        logging.debug(f"Horizon {horizon}: 使用简单标准化处理")
+                    # 使用简单的标准化 (z-score)
+                    exog = (exog - exog.mean()) / (exog.std() + 1e-8)
+                    logging.debug(f"Horizon {horizon}: 已对解释变量进行标准化处理")
             except Exception as e_cond:
                 logging.warning(f"Horizon {horizon}: 条件数计算失败: {e_cond}")
         else:
