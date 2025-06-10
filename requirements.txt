@@ -1,5 +1,5 @@
 # 数据处理
-numpy==1.24.3
+numpy==1.26.4
 pandas==2.0.3
 scipy==1.11.4
 pyarrow==20.0.0
