@@ -29,11 +29,26 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- 辅助计算函数 ---
 
 def calculate_gk_volatility(high, low, close, open_):
-    """计算 Garman-Klass (GK) 波动率的平方项 (未开根号和取对数)"""
+    """计算 Garman-Klass (GK) 波动率的平方项 (未开根号和取对数)
+    
+    根据 Garman & Klass (1980) 原文公式:
+    GK = 0.5 * [ln(H/L)]² - (2*ln(2) - 1) * [ln(C/O)]²
+    
+    参数:
+        high, low, close, open_: 价格序列
+    
+    返回:
+        gk_sq: GK波动率的平方项
+    """
     log_hl = np.log(high / low)
     log_co = np.log(close / open_)
+    
+    # Garman-Klass 公式
+    # 注意：这里计算的是波动率的平方，不是方差
     gk_sq = 0.5 * (log_hl**2) - (2 * np.log(2) - 1) * (log_co**2)
+    
     # 处理潜在的负值 (理论上不应出现，但实证中可能因数据质量产生)
+    # 这种情况可能发生在价格数据有问题时（如开盘价大幅偏离合理范围）
     gk_sq = np.maximum(gk_sq, 1e-10) # 替换为极小的正数
     return gk_sq
 
@@ -66,7 +81,8 @@ def get_holiday_windows(holiday_spec, pre_window_days, post_window_days):
     返回: list of tuples [(window_start, window_end, holiday_name, year), ...]
     """
     holiday_windows = []
-    trading_days = pd.date_range(start=config.ANALYSIS_START_DATE, end=config.ANALYSIS_END_DATE, freq='B') # 近似交易日
+    # 使用工作日作为交易日的近似（不考虑具体的节假日，因为这里就是在计算节假日窗口）
+    trading_days = pd.date_range(start=config.ANALYSIS_START_DATE, end=config.ANALYSIS_END_DATE, freq='B')
 
     for holiday_name, years_spec in holiday_spec.items():
         for year, (start_str, end_str) in years_spec.items():
@@ -130,11 +146,12 @@ def build_features():
     # 统一列名为小写
     df.columns = df.columns.str.lower()
 
-    # 定义列映射 (从原始列名到脚本使用的标准列名) - 根据用户反馈调整
-    # 用户反馈列名: date, variety, yield_rate, long_margin, short_margin, volume_change,
+    # 定义列映射 (从原始列名到脚本使用的标准列名) - 基于实际数据文件的列名
+    # 实际数据列名: Unnamed: 0, date, variety, yield_rate, long_margin, short_margin, volume_change,
     # price_limit, high_price, low_price, trading_volume, margin_rate, market_state,
     # max_yield, exchange, variety_code, variety_type, close_price, open_price,
-    # open_interest, announcement_date
+    # open_interest, announce_date, variety_codes, rel_day, D_annc, D_up, holiday_pre,
+    # holiday_post, margin_changed, first_treatment_date, treat
     column_mapping = {
         'date': 'date',
         'variety_code': 'contract_id', # 使用 variety_code 作为合约标识
@@ -145,7 +162,7 @@ def build_features():
         'trading_volume': 'volume',
         'open_interest': 'open_interest',
         'margin_rate': config.MARGIN_RATE_COLUMN, # 使用 config 中定义的保证金列名
-        'announce_date': 'announcement_date', # 保留公告日期
+        'announce_date': 'announcement_date', # 注意：实际数据中是 announce_date
         # 保留其他可能需要的原始列
         'variety': 'variety',
         'exchange': 'exchange',
@@ -193,9 +210,11 @@ def build_features():
     for col in price_cols:
         df[col] = df[col].replace(0, np.nan) # 假设 0 是无效价格
         df[col] = df[col].apply(lambda x: x if x > 0 else np.nan)
-    # 确保 high >= low, high >= open, high >= close, low <= open, low <= close
-    df['high'] = df[['high', 'low', 'open', 'close']].max(axis=1)
-    df['low'] = df[['high', 'low', 'open', 'close']].min(axis=1)
+    # 确保价格数据的逻辑一致性：high >= max(open, close), low <= min(open, close)
+    # 注意：这里要小心处理，避免破坏原始的high/low信息
+    # 只在明显异常的情况下才调整
+    df['high'] = np.maximum(df['high'], np.maximum(df['open'], df['close']))
+    df['low'] = np.minimum(df['low'], np.minimum(df['open'], df['close']))
     # 如果 high == low，波动率计算会出问题，检查这种情况
     if (df['high'] == df['low']).any():
          logging.warning("数据中存在最高价等于最低价的情况，可能影响波动率计算。")
@@ -208,11 +227,17 @@ def build_features():
     # 对于成交量/持仓量，填充 0 或向前填充？
     # 保证金率缺失如何处理？向前填充？
     fill_cols = ['open', 'high', 'low', 'close', 'volume', 'open_interest', config.MARGIN_RATE_COLUMN]
-    # 检查涨跌停列是否存在
-    if 'upper_limit' in df.columns and 'lower_limit' in df.columns:
+    # 涨跌停信息处理
+    # 实际数据中可能只有price_limit（涨跌停幅度），需要计算具体的上下限价格
+    if 'price_limit' in df.columns:
+        # 根据price_limit和close_price计算涨跌停价格
+        # 假设price_limit是涨跌停幅度（百分比）
+        df['upper_limit'] = df['close'].shift(1) * (1 + df['price_limit'] / 100)
+        df['lower_limit'] = df['close'].shift(1) * (1 - df['price_limit'] / 100)
         fill_cols.extend(['upper_limit', 'lower_limit'])
+        logging.info("根据price_limit计算涨跌停价格")
     else:
-        logging.warning("缺少涨跌停价格列 ('upper_limit', 'lower_limit')，无法计算涨跌停状态。")
+        logging.warning("缺少价格限制信息，无法计算涨跌停状态。")
 
 
     df[fill_cols] = df.groupby('contract_id')[fill_cols].ffill()
@@ -255,12 +280,43 @@ def build_features():
          return
 
     # 计算对数保证金率的滞后值
+    # 检查保证金率的数据格式并进行适当的处理
+    logging.info(f"保证金率数据诊断 - 范围: {df[config.MARGIN_RATE_COLUMN].min():.2f} - {df[config.MARGIN_RATE_COLUMN].max():.2f}")
+    logging.info(f"保证金率数据诊断 - 唯一值数量: {df[config.MARGIN_RATE_COLUMN].nunique()}")
+    
+    # 检查保证金率是否为百分比形式（如5表示5%）还是小数形式（如0.05表示5%）
+    max_rate = df[config.MARGIN_RATE_COLUMN].max()
+    if max_rate > 1.5:  # 如果最大值大于1.5，说明是百分比形式（如5%, 10%等）
+        logging.info("检测到保证金率为百分比形式，将转换为小数形式")
+        df[config.MARGIN_RATE_COLUMN] = df[config.MARGIN_RATE_COLUMN] / 100.0  # 转换为小数形式
+    else:
+        logging.info("检测到保证金率已为小数形式")
+    
+    # 处理保证金率中的异常值（负值或过大值）
+    # 合理的保证金率应该在0.1%到100%之间（小数形式为0.001到1.0）
+    original_min = df[config.MARGIN_RATE_COLUMN].min()
+    original_max = df[config.MARGIN_RATE_COLUMN].max()
+    df[config.MARGIN_RATE_COLUMN] = df[config.MARGIN_RATE_COLUMN].clip(lower=0.001, upper=1.0)
+    clipped_min = df[config.MARGIN_RATE_COLUMN].min()
+    clipped_max = df[config.MARGIN_RATE_COLUMN].max()
+    
+    logging.info(f"保证金率clip处理: {original_min:.4f}-{original_max:.4f} -> {clipped_min:.4f}-{clipped_max:.4f}")
+    
     df['log_margin_rate'] = np.log(df[config.MARGIN_RATE_COLUMN].replace(0, 1e-10)) # 避免 log(0)
     df['log_margin_rate_lag1'] = df.groupby('contract_id')['log_margin_rate'].shift(1)
     # 计算对数差分
     df['dlog_margin_rate'] = df['log_margin_rate'] - df['log_margin_rate_lag1']
+    # 处理极端值（可能的数据错误）
+    df['dlog_margin_rate'] = df['dlog_margin_rate'].clip(lower=-2.0, upper=2.0)  # 限制在±200%变化范围内
     # 处理每个合约的第一期观测 (差分为 NaN)
     df['dlog_margin_rate'].fillna(0, inplace=True) # 假设第一期无冲击
+    
+    # 添加保证金率变化的诊断信息
+    non_zero_changes = (df['dlog_margin_rate'] != 0).sum()
+    logging.info(f"保证金率变化诊断 - 非零变化数量: {non_zero_changes}")
+    logging.info(f"保证金率变化诊断 - 非零变化比例: {non_zero_changes/len(df):.4f}")
+    if non_zero_changes > 0:
+        logging.info(f"保证金率变化诊断 - 变化范围: {df['dlog_margin_rate'].min():.4f} - {df['dlog_margin_rate'].max():.4f}")
 
     # 区分保证金上升/下降冲击 (可选，LP 分析中可以直接用 dlog_margin_rate)
     df['margin_increase_shock'] = np.where(df['dlog_margin_rate'] > 1e-8, df['dlog_margin_rate'], 0) # 加小容差
@@ -442,7 +498,72 @@ def build_features():
              logging.warning(f"基础变量 {base_var} 不存在于 DataFrame 中，无法创建滞后项 {var}")
 
 
-    # --- 7. 清理和保存 ---
+    # --- 7. 数据质量修复和清理 ---
+    logging.info("数据质量修复和清理...")
+    
+    # 7.1 检查和去除重复数据
+    logging.info("检查重复数据...")
+    duplicates = df.groupby(['contract_id', 'date']).size()
+    duplicate_entries = duplicates[duplicates > 1]
+    
+    if len(duplicate_entries) > 0:
+        logging.warning(f"发现 {len(duplicate_entries)} 个重复的(contract_id, date)组合，涉及 {duplicate_entries.sum()} 行数据")
+        logging.info("去除重复数据，保留每个(contract_id, date)的第一个观测...")
+        df = df.groupby(['contract_id', 'date']).first().reset_index()
+        logging.info(f"去重后数据形状: {df.shape}")
+    else:
+        logging.info("未发现重复数据")
+    
+    # 7.2 处理异常波动率值
+    logging.info("检查异常波动率值...")
+    extreme_vol_mask = df['log_gk_volatility'] < -10
+    extreme_count = extreme_vol_mask.sum()
+    
+    if extreme_count > 0:
+        logging.warning(f"发现 {extreme_count} 个异常低波动率值(<-10)")
+        extreme_by_contract = df[extreme_vol_mask]['contract_id'].value_counts()
+        logging.warning(f"异常值按合约分布: {extreme_by_contract.to_dict()}")
+        
+        # 用合约内的5日移动中位数替换异常值
+        logging.info("用合约内移动中位数替换异常波动率值...")
+        for contract in extreme_by_contract.index:
+            contract_mask = df['contract_id'] == contract
+            contract_data = df[contract_mask].sort_values('date').copy()
+            
+            # 计算移动中位数（5日窗口）
+            rolling_median = contract_data['log_gk_volatility'].rolling(window=5, min_periods=1, center=True).median()
+            
+            # 替换异常值
+            extreme_mask_contract = contract_mask & extreme_vol_mask
+            df.loc[extreme_mask_contract, 'log_gk_volatility'] = rolling_median[df.loc[extreme_mask_contract].index].values
+            
+            replaced_count = extreme_mask_contract.sum()
+            logging.info(f"合约 {contract}: 替换了 {replaced_count} 个异常值")
+    
+    # 7.3 重新计算滞后变量（因为数据结构可能已改变）
+    logging.info("重新计算关键滞后变量...")
+    df = df.sort_values(['contract_id', 'date']).reset_index(drop=True)
+    
+    # 重新计算波动率滞后项
+    df['log_gk_volatility_lag1'] = df.groupby('contract_id')['log_gk_volatility'].shift(1)
+    
+    # 重新计算保证金相关变量
+    df['log_margin_rate'] = np.log(df[config.MARGIN_RATE_COLUMN])
+    df['log_margin_rate_lag1'] = df.groupby('contract_id')['log_margin_rate'].shift(1)
+    df['dlog_margin_rate'] = df['log_margin_rate'] - df['log_margin_rate_lag1']
+    df['dlog_margin_rate'].fillna(0, inplace=True)
+    
+    # 重新创建冲击变量
+    df['margin_increase_shock'] = np.where(df['dlog_margin_rate'] > 1e-8, df['dlog_margin_rate'], 0)
+    df['margin_decrease_shock'] = np.where(df['dlog_margin_rate'] < -1e-8, df['dlog_margin_rate'], 0)
+    
+    # 验证保证金变化
+    non_zero_changes = (df['dlog_margin_rate'] != 0).sum()
+    logging.info(f"修复后非零保证金变化数量: {non_zero_changes}")
+    if non_zero_changes > 0:
+        logging.info(f"保证金变化范围: {df['dlog_margin_rate'].min():.4f} - {df['dlog_margin_rate'].max():.4f}")
+
+    # --- 8. 最终清理和保存 ---
     logging.info("最后清理和保存数据...")
 
     # 选择最终需要的列 (根据后续分析调整)
@@ -452,6 +573,7 @@ def build_features():
         'contract_id', 'date',
         'log_gk_volatility', # 主要结果变量
         'dlog_margin_rate', 'margin_increase_shock', 'margin_decrease_shock', # 冲击变量
+        config.MARGIN_RATE_COLUMN, 'log_margin_rate', 'log_margin_rate_lag1', # 保证金率相关变量（用于诊断和验证）
         # DID 相关
         'treat_date_g', 'treat_group_g_label', 'relative_time_t', 'is_holiday_adjustment_day',
         # 状态变量 (t-1 时刻) - 注意 get_dummies 后缀
@@ -541,15 +663,13 @@ def build_features():
                              f"首次处理日期 treat_date_g = {row['treat_date_g'].strftime('%Y-%m-%d') if pd.notna(row['treat_date_g']) else 'N/A'}, "
                              f"在该日期前的数据点数 (最终) = {row['final_pre_treatment_points']}")
             
-            # critical_contracts = final_summary_df[final_summary_df['final_pre_treatment_points'] < config.MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK if hasattr(config, 'MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK') else 2] # 使用config中的值或默认值2
-            # --- 修改：明确比较值 --- 
+            # 检查是否有处理前观测点过少的合约
             min_obs_val = 2 # 默认值
             if hasattr(config, 'MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK'):
                 min_obs_val = config.MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK
             logging.info(f"用于筛选 critical_contracts 的最小观测点阈值 (min_obs_val): {min_obs_val}")
             
             critical_contracts = final_summary_df[final_summary_df['final_pre_treatment_points'] < min_obs_val]
-            # --- 结束修改 ---
             if not critical_contracts.empty:
                 logging.warning(f"警告：以下合约在最终数据集中，其首次处理日期前的观测点少于 {min_obs_val} 个，可能导致 DID 分析问题:")
                 for contract_id_val, row in critical_contracts.iterrows():

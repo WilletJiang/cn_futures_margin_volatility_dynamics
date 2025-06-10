@@ -114,7 +114,7 @@ DID_EVENT_WINDOW_POST = 20 # 事件后窗口期 (t=+20)
 DID_CLUSTER_VAR = "contract_id" # DID 聚类稳健标准误的变量 (根据 C&S 包要求调整)
 
 # 5.2 LP-IRF (局部投影)
-LP_HORIZON = 20 # 脉冲响应期数 H (0 到 20)
+LP_HORIZON = 10 # 脉冲响应期数 H (0 到 10) - 缩短以提高精度
 LP_CONTROL_LAGS = 1 # 控制变量滞后阶数 (通常为 t-1)
 LP_CLUSTER_VARS = ["contract_id", "date"] # LP 双向聚类稳健标准误的变量
 
@@ -148,6 +148,27 @@ ALT_VOLATILITY_VAR = "log_parkinson_volatility_lag1" # 使用滞后对数Parkins
 # 如果多空不同，是否分开分析? 这里先假设用平均值或有统一字段
 MARGIN_RATE_COLUMN = "margin_rate" # 假设原始数据中有此列名，或需要计算得出
 
-# --- 9. 其他 ---
+# --- 9. 数据质量检查参数 ---
+# DID分析中要求的最小处理前观测点数
+MIN_PRE_TREATMENT_OBSERVATIONS_DID_CHECK = 5  # 至少需要5个处理前观测点
+
+# --- 10. 其他 ---
 # 绘图风格
 PLOT_STYLE = "seaborn-v0_8-darkgrid"
+
+# --- 参数验证 ---
+def validate_config():
+    """验证配置参数的合理性"""
+    assert LP_HORIZON > 0, "LP_HORIZON must be positive"
+    assert LP_CONTROL_LAGS >= 0, "LP_CONTROL_LAGS must be non-negative"
+    assert DID_HOLIDAY_WINDOW_PRE > 0, "DID_HOLIDAY_WINDOW_PRE must be positive"
+    assert DID_HOLIDAY_WINDOW_POST > 0, "DID_HOLIDAY_WINDOW_POST must be positive"
+    assert 0 < VOLATILITY_REGIME_QUANTILE < 1, "VOLATILITY_REGIME_QUANTILE must be between 0 and 1"
+    assert MARKET_REGIME_UPPER_THRESHOLD > MARKET_REGIME_LOWER_THRESHOLD, "Upper threshold must be greater than lower threshold"
+
+# 运行验证
+try:
+    validate_config()
+except AssertionError as e:
+    print(f"Configuration validation failed: {e}")
+    raise

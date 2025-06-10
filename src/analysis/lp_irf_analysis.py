@@ -24,7 +24,7 @@ except ImportError:
 
 # --- 日志配置 ---
 # 注意：如果作为模块导入，日志配置可能需要在调用脚本中完成
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 
 # --- 核心 LP 估计函数 ---
 
@@ -54,18 +54,15 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
 
     df_h = data.copy()
 
-    # 1. 创建因变量 Y_{t+h} - Y_{t-1}
+    # 1. 创建因变量 - 使用水平形式 Y_{t+h}
+    # 按用户要求，使用Y(t+h)作为因变量，而不是差分形式
+    
     # Y_{t+h}
     df_h[f'{outcome_var}_h'] = df_h.groupby(entity_col)[outcome_var].shift(-horizon)
-    # Y_{t-1}
-    # 检查 outcome_var 是否已存在 lag1，如果 build_features 已创建则直接使用
-    outcome_lag1_col = f'{outcome_var}_lag1'
-    if outcome_lag1_col not in df_h.columns:
-        df_h[outcome_lag1_col] = df_h.groupby(entity_col)[outcome_var].shift(1)
-
-    # Dependent variable
-    dep_var = f'{outcome_var}_diff_h{horizon}'
-    df_h[dep_var] = df_h[f'{outcome_var}_h'] - df_h[outcome_lag1_col]
+    
+    # 因变量：直接使用Y_{t+h}
+    dep_var = f'{outcome_var}_level_h{horizon}'
+    df_h[dep_var] = df_h[f'{outcome_var}_h']
 
     # 2. 定义自变量
     exog_vars = []
@@ -83,12 +80,41 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
              logging.error(f"冲击变量 '{shock_var}' 不在数据中。")
              return None
 
-        df_h[interaction_term_name] = df_h[shock_var] * df_h[interaction_state_var]
-        exog_vars.append(interaction_term_name)
-        target_var = interaction_term_name
-        # 根据模型设定，可能还需要包含冲击变量本身和状态变量本身 (如果固定效应不吸收)
-        # exog_vars.append(shock_var)
-        # exog_vars.append(interaction_state_var)
+        # --- 改进：检查交互状态变量的有效性 ---
+        state_nunique = df_h[interaction_state_var].nunique()
+        state_std = df_h[interaction_state_var].std()
+        
+        if state_nunique < 2:
+            logging.warning(f"Horizon {horizon}: 交互状态变量 '{interaction_state_var}' 只有 {state_nunique} 个唯一值，跳过交互项")
+            # 退回到简单模式
+            exog_vars.append(shock_var)
+            target_var = shock_var
+        elif state_std < 1e-10:
+            logging.warning(f"Horizon {horizon}: 交互状态变量 '{interaction_state_var}' 标准差过小 ({state_std:.2e})，跳过交互项")
+            # 退回到简单模式
+            exog_vars.append(shock_var)
+            target_var = shock_var
+        else:
+            # 创建交互项，但先标准化状态变量以提高数值稳定性
+            df_h[f"{interaction_state_var}_scaled"] = (df_h[interaction_state_var] - df_h[interaction_state_var].mean()) / (df_h[interaction_state_var].std() + 1e-8)
+            
+            df_h[interaction_term_name] = df_h[shock_var] * df_h[f"{interaction_state_var}_scaled"]
+            
+            # 检查交互项的有效性
+            interaction_nunique = df_h[interaction_term_name].nunique()
+            interaction_nonzero = (df_h[interaction_term_name] != 0).sum()
+            
+            if interaction_nunique < 2 or interaction_nonzero < 10:
+                logging.warning(f"Horizon {horizon}: 交互项 '{interaction_term_name}' 变异不足 (唯一值={interaction_nunique}, 非零={interaction_nonzero})，退回到简单模式")
+                # 退回到简单模式
+                exog_vars.append(shock_var)
+                target_var = shock_var
+            else:
+                logging.debug(f"Horizon {horizon}: 创建交互项 '{interaction_term_name}' (唯一值={interaction_nunique}, 非零={interaction_nonzero})")
+                exog_vars.append(interaction_term_name)
+                target_var = interaction_term_name
+                # 添加标准化后的状态变量
+                exog_vars.append(f"{interaction_state_var}_scaled")
     else:
         # 否则，目标是冲击变量的系数
         if shock_var not in df_h.columns:
@@ -137,54 +163,89 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
             logging.debug(f"DEBUG Horizon 3 Baseline: Could not compute correlation matrix: {e_corr}")
 
     try:
+        # --- 数据质量改进：异常值处理 ---
+        # 对连续变量进行异常值截尾处理，提高数值稳定性
+        for var in exog_vars:
+            if var in df_reg.columns and var not in [shock_var]:  # 不处理冲击变量本身
+                if df_reg[var].dtype in ['float64', 'int64']:
+                    # 使用1%和99%分位数进行截尾
+                    q01 = df_reg[var].quantile(0.01)
+                    q99 = df_reg[var].quantile(0.99)
+                    original_outliers = ((df_reg[var] < q01) | (df_reg[var] > q99)).sum()
+                    if original_outliers > 0:
+                        df_reg[var] = np.clip(df_reg[var], q01, q99)
+                        logging.debug(f"Horizon {horizon}: 截尾处理 {var}，处理了 {original_outliers} 个异常值")
+        
         # 设置面板索引
         df_reg = df_reg.set_index([entity_col, time_col])
         exog = df_reg[exog_vars]
 
-        # --- 调试：检查解释变量 ---
+        # --- 数值稳定性检查 ---
         logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Exogenous variables being used: {exog_vars}")
+        
+        # 检查变量的有效性
+        valid_vars = []
         for var in exog_vars:
             if var in exog.columns:
-                logging.debug(f"  Var '{var}': nunique={exog[var].nunique()}, dtype={exog[var].dtype}, non_na_count={exog[var].notna().sum()}")
-                if exog[var].nunique() < 2 and exog[var].notna().sum() > 0 : # 如果变量存在但没有变化 (例如全是0或全是同一个值)
-                     logging.warning(f"  WARNING Var '{var}': has {exog[var].nunique()} unique values but {exog[var].notna().sum()} non-NA observations. This could cause perfect collinearity or an intercept-only like variable.")
-                     logging.debug(f"    Value counts for '{var}':\\n{exog[var].value_counts(dropna=False).to_string()}")
-            else:
-                logging.error(f"  Var '{var}' specified in exog_vars but not found in exog DataFrame columns after set_index and selection.")
-        
-        # --- 调试：计算条件数 ---
-        try:
-            if not exog.empty and exog.shape[1] > 0: # 确保 exog 不为空且有列
-                # 确保所有列都是数值类型，对于 PanelOLS 通常会自动处理，但条件数计算需要显式数值
-                exog_numeric = exog.select_dtypes(include=np.number)
-                if exog_numeric.shape[1] < exog.shape[1]:
-                    logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Not all exogenous variables are numeric for condition number calculation. Original exog columns: {exog.columns.tolist()}, Numeric exog columns: {exog_numeric.columns.tolist()}")
+                var_data = exog[var]
+                nunique = var_data.nunique()
+                std_dev = var_data.std()
                 
-                if not exog_numeric.empty and exog_numeric.shape[1] > 0:
-                    # 添加常数项以模拟回归中的截距（如果模型有截距且未被固定效应吸收）
-                    # PanelOLS 通常自己处理截距和固定效应，这里我们只看解释变量自身的共线性
-                    # X = sm.add_constant(exog_numeric, prepend=True) if not entity_effects and not time_effects else exog_numeric # 根据是否有固定效应决定是否加常数
-                    # 考虑到 PanelOLS 会处理固定效应，我们主要关注 exog_vars 之间的共线性。
-                    # 如果 exog_vars 包含了一个接近常数的列 (除了固定效应之外)，那也会有问题。
-                    X_for_cond = exog_numeric.copy()
-                    # 检查是否存在方差为0的列 (常数项)
-                    constant_cols = X_for_cond.columns[X_for_cond.var() < 1e-10] # 方差极小的列
-                    if len(constant_cols) > 0:
-                        logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Exogenous variables include constant-like columns (after selecting numeric): {constant_cols.tolist()}. This will lead to perfect collinearity if not handled by fixed effects.")
-                        # 尝试移除这些列再计算条件数，但这可能改变模型
-                        # X_for_cond = X_for_cond.drop(columns=constant_cols)
-                    
-                    if not X_for_cond.empty and X_for_cond.shape[1] > 0:
-                        condition_number = np.linalg.cond(X_for_cond)
-                        logging.info(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Condition number of exogenous variables (numeric part): {condition_number:.2f}")
-                        if condition_number > 30: # 一个常用的经验阈值
-                            logging.warning(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: High condition number ({condition_number:.2f}) suggests potential multicollinearity.")
-                    else:
-                        logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Exogenous numeric matrix for condition number is empty or has no columns after filtering constant-like columns.")
+                # 检查变量是否有足够的变异
+                if nunique < 2:
+                    logging.warning(f"  WARNING {var}: 只有 {nunique} 个唯一值，跳过此变量")
+                    continue
+                elif std_dev < 1e-10:
+                    logging.warning(f"  WARNING {var}: 标准差过小 ({std_dev:.2e})，跳过此变量")
+                    continue
                 else:
-                    logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: No numeric exogenous variables to calculate condition number.")
-        except Exception as e_cond:
-            logging.error(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var}: Error calculating condition number: {e_cond}")
+                    valid_vars.append(var)
+                    logging.debug(f"  {var}: nunique={nunique}, std={std_dev:.6f}")
+            else:
+                logging.error(f"  {var}: 变量不存在")
+        
+        # 如果有效变量太少，返回失败
+        if len(valid_vars) < len(exog_vars):
+            logging.warning(f"Horizon {horizon}: 原有 {len(exog_vars)} 个变量，只有 {len(valid_vars)} 个有效")
+            if len(valid_vars) == 0:
+                logging.error(f"Horizon {horizon}: 没有有效的解释变量")
+                return None
+            # 更新变量列表
+            exog = exog[valid_vars]
+            exog_vars = valid_vars
+        
+        # --- 条件数检查和处理 ---
+        if not exog.empty and exog.shape[1] > 0:
+            try:
+                condition_number = np.linalg.cond(exog)
+                logging.debug(f"Horizon {horizon}: 设计矩阵条件数: {condition_number:.2f}")
+                
+                # 如果条件数过高，尝试岭回归正则化
+                if condition_number > 100:
+                    logging.warning(f"Horizon {horizon}: 条件数过高 ({condition_number:.2f})，将使用数值稳定化处理")
+                    # 添加微小的岭正则化到对角线
+                    ridge_param = 1e-6
+                    exog_stabilized = exog.copy()
+                    # 对数据进行标准化以提高数值稳定性
+                    from sklearn.preprocessing import StandardScaler
+                    try:
+                        scaler = StandardScaler()
+                        exog_scaled = pd.DataFrame(
+                            scaler.fit_transform(exog_stabilized),
+                            index=exog_stabilized.index,
+                            columns=exog_stabilized.columns
+                        )
+                        exog = exog_scaled
+                        logging.debug(f"Horizon {horizon}: 已对解释变量进行标准化处理")
+                    except:
+                        # 如果sklearn不可用，使用简单的标准化
+                        exog = (exog - exog.mean()) / (exog.std() + 1e-8)
+                        logging.debug(f"Horizon {horizon}: 使用简单标准化处理")
+            except Exception as e_cond:
+                logging.warning(f"Horizon {horizon}: 条件数计算失败: {e_cond}")
+        else:
+            logging.error(f"Horizon {horizon}: 解释变量矩阵为空")
+            return None
 
         # 4. 执行 PanelOLS 回归
         # mod = PanelOLS(df_reg[dep_var], exog, entity_effects=True, time_effects=True, check_rank=False) # MODIFIED: Original line commented out
@@ -202,28 +263,77 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
             # 这条日志现在由下面的通用日志代替
             # logger.debug(f"Horizon {h}, Shock {shock_var}, Interaction {interaction_state_var if interaction_state_var else 'None'}: 使用 check_rank={use_strict_rank_check} ({log_rank_check_reason}")
         
-        logging.debug(f"Horizon {horizon}, Shock {shock_var}, Interaction {interaction_state_var if interaction_state_var else 'None'}: 设置 check_rank={use_strict_rank_check} ({log_rank_check_reason})")
-        mod = PanelOLS(df_reg[dep_var], exog, entity_effects=True, time_effects=True, check_rank=use_strict_rank_check)
-
-        # 配置聚类标准误
-        cluster_config = {}
-        cluster_vars = []
-        if cluster_entity: cluster_vars.append(entity_col)
-        if cluster_time: cluster_vars.append(time_col)
-
-        # linearmodels 的聚类需要原始数据框和索引名
-        if cluster_entity and cluster_time:
-            cluster_config['cluster_entity'] = True
-            cluster_config['cluster_time'] = True
-            cov_type_str = 'clustered'
-        elif cluster_entity:
-            cluster_config['cluster_entity'] = True
-            cov_type_str = 'clustered'
-        elif cluster_time:
-             cluster_config['cluster_time'] = True
-             cov_type_str = 'clustered'
+        # 改进：针对稀疏数据优化固定效应设定
+        n_obs = len(df_reg)
+        n_entities = df_reg.index.get_level_values(0).nunique()
+        n_periods = df_reg.index.get_level_values(1).nunique()
+        
+        # 检查非零冲击的分布
+        if target_var in exog.columns:
+            non_zero_shocks = (exog[target_var] != 0).sum()
+            shock_ratio = non_zero_shocks / n_obs if n_obs > 0 else 0
         else:
-            cov_type_str = 'robust' # 默认异方差稳健
+            non_zero_shocks = 0
+            shock_ratio = 0
+        
+        # 动态调整固定效应策略
+        if shock_ratio < 0.05:  # 如果非零冲击少于5%
+            # 对于极稀疏数据，只使用实体固定效应
+            use_entity_effects = True
+            use_time_effects = False
+            logging.info(f"Horizon {horizon}: 稀疏数据模式 (非零冲击比例: {shock_ratio:.3f})，仅使用实体固定效应")
+        elif n_obs > 5000 and n_periods > 500:
+            # 对于大样本，使用双向固定效应
+            use_entity_effects = True
+            use_time_effects = True
+            logging.info(f"Horizon {horizon}: 大样本模式，使用双向固定效应")
+        else:
+            # 中等样本，仅使用实体固定效应
+            use_entity_effects = True
+            use_time_effects = False
+            logging.info(f"Horizon {horizon}: 中等样本模式，仅使用实体固定效应")
+        
+        logging.debug(f"Horizon {horizon}: 数据规模 - 观测值={n_obs}, 实体={n_entities}, 时期={n_periods}, 非零冲击={non_zero_shocks}")
+        
+        mod = PanelOLS(df_reg[dep_var], exog, entity_effects=use_entity_effects, time_effects=use_time_effects, check_rank=use_strict_rank_check)
+
+        # 配置标准误 - 针对稀疏数据优化
+        cluster_config = {}
+        
+        # 基于数据特征动态选择标准误类型
+        if shock_ratio < 0.02:  # 极稀疏数据（非零冲击<2%）
+            # 使用简单稳健标准误，避免聚类导致的标准误膨胀
+            cov_type_str = 'robust'
+            effective_cluster_config = {}
+            logging.info(f"Horizon {horizon}: 极稀疏数据 (冲击比例: {shock_ratio:.3f})，使用稳健标准误")
+        elif shock_ratio < 0.05 or n_entities < 10:  # 稀疏数据或实体数量少
+            # 仅使用实体聚类
+            if cluster_entity:
+                cluster_config['cluster_entity'] = True
+                cov_type_str = 'clustered'
+                effective_cluster_config = cluster_config
+                logging.info(f"Horizon {horizon}: 稀疏数据，使用实体聚类标准误")
+            else:
+                cov_type_str = 'robust'
+                effective_cluster_config = {}
+                logging.info(f"Horizon {horizon}: 稀疏数据，使用稳健标准误")
+        else:
+            # 数据相对充足时使用双向聚类
+            if cluster_entity and cluster_time and n_entities >= 5 and n_periods >= 50:
+                cluster_config['cluster_entity'] = True
+                cluster_config['cluster_time'] = True
+                cov_type_str = 'clustered'
+                effective_cluster_config = cluster_config
+                logging.info(f"Horizon {horizon}: 使用双向聚类标准误")
+            elif cluster_entity:
+                cluster_config['cluster_entity'] = True
+                cov_type_str = 'clustered'
+                effective_cluster_config = cluster_config
+                logging.info(f"Horizon {horizon}: 使用实体聚类标准误")
+            else:
+                cov_type_str = 'robust'
+                effective_cluster_config = {}
+                logging.info(f"Horizon {horizon}: 使用稳健标准误")
 
         # 针对 market_regime_Neutral 在特定 horizons 上 NaN SE 问题的特别处理
         problematic_horizons_for_neutral = [5, 6, 11, 12, 16]
@@ -246,7 +356,7 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
             logging.debug(f"Horizon {horizon}, Interaction {interaction_state_var if interaction_state_var else 'None'}: effective_cluster_config is {effective_cluster_config}. Calling fit with cov_type='{cov_type_str}' and config.")
             results = mod.fit(cov_type=cov_type_str, **effective_cluster_config)
 
-        # 5. 提取结果
+        # 5. 提取结果并进行数值稳定性检查
         coeff = results.params[target_var]
         stderr = results.std_errors[target_var]
         pval = results.pvalues[target_var]
@@ -254,7 +364,29 @@ def estimate_lp_horizon(data, horizon, outcome_var, shock_var, controls,
         conf_low = conf_int['lower']
         conf_high = conf_int['upper']
 
-        logging.debug(f"Horizon {horizon}, Target {target_var}: Coeff={coeff:.4f}, SE={stderr:.4f}, Pval={pval:.3f}")
+        # --- 数值稳定性检查：防止无穷大和NaN ---
+        if np.isnan(coeff) or np.isinf(coeff):
+            logging.warning(f"Horizon {horizon}: 系数为NaN或无穷大 ({coeff})，跳过此结果")
+            return None
+        
+        if np.isnan(stderr) or np.isinf(stderr) or stderr <= 0:
+            logging.warning(f"Horizon {horizon}: 标准误异常 ({stderr})，跳过此结果")
+            return None
+            
+        if np.isnan(pval) or np.isinf(pval):
+            logging.warning(f"Horizon {horizon}: p值异常 ({pval})，跳过此结果")
+            return None
+            
+        if np.isnan(conf_low) or np.isinf(conf_low) or np.isnan(conf_high) or np.isinf(conf_high):
+            logging.warning(f"Horizon {horizon}: 置信区间异常 ([{conf_low}, {conf_high}])，跳过此结果")
+            return None
+        
+        # 检查置信区间是否过宽（可能表明估计不稳定）
+        ci_width = conf_high - conf_low
+        if ci_width > 10 * abs(coeff):  # 如果置信区间宽度超过系数绝对值的10倍
+            logging.warning(f"Horizon {horizon}: 置信区间过宽 (系数={coeff:.4f}, 宽度={ci_width:.4f})，估计可能不稳定")
+
+        logging.debug(f"Horizon {horizon}, Target {target_var}: Coeff={coeff:.4f}, SE={stderr:.4f}, Pval={pval:.3f}, CI=[{conf_low:.4f}, {conf_high:.4f}]")
         return coeff, stderr, pval, conf_low, conf_high
 
     except KeyError as e:
