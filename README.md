@@ -9,7 +9,7 @@
 ## 项目概述
 
 ### 研究目的
-本研究旨在量化分析期货保证金率调整对市场波动率的动态影响，探索：
+本研究旨在分析期货保证金率调整对市场波动率的动态影响，探索：
 - 保证金调整的短期和中期市场效应
 - 不同市场状态下政策效果的异质性
 - 保证金增加与减少的非对称影响
@@ -292,10 +292,10 @@ SOFTWARE.
 
 ```bibtex
 @software{futures_margin_volatility_dynamics,
-  title={期货保证金波动动态研究},
-  author={[作者姓名]},
+  title={中国期货保证金波动动态研究},
+  author={[XXX]},
   year={2024},
-  url={https://github.com/[username]/futures_margin_volatility_dynamics},
-  note={期货保证金调整对市场波动率动态影响的实证研究}
+  url={https://github.com/willetjiang/futures_margin_volatility_dynamics},
+  note={中国期货保证金调整对市场波动率动态影响的实证研究}
 }
 ```
